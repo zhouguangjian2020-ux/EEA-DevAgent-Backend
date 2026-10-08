@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.env
+*.py[cod]
+
+# Local verification evidence and source backups
+artifacts/
+
+# Generated validation/release files excluded from source baseline
+/tmp/
+*.log
+*.gz
+*.zip

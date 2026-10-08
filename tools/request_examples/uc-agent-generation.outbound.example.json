@@ -1,0 +1,24 @@
+{
+  "message": "先查询 uc_template.path，再根据完整 reference_data.prd_markdown 生成供审阅的 UC 候选。返回 structured.use_cases；每项不要返回 number、candidate_id、ordinal 或正式对象/版本 ID。分支和异常按 PRD 实际数量生成。",
+  "scene": "FROM_PRD_CREATE_UC",
+  "reference_data": {
+    "source": {
+      "kind": "PRD",
+      "project_id": "11111111-1111-4111-8111-111111111111",
+      "function_id": "22222222-2222-4222-8222-222222222222",
+      "artifact_id": "33333333-3333-4333-8333-333333333333",
+      "revision_id": "44444444-4444-4444-8444-444444444444"
+    },
+    "prd_markdown": "# 记录事件\n\n## 目标\n系统记录驾驶事件。\n\n## 约束\n设备上电后可用。",
+    "uc_template": {
+      "template_id": "uc-default",
+      "template_version": "1",
+      "path": "/v1/agent/uc-template?scene=FROM_PRD_CREATE_UC",
+      "auth_header": "X-Agent-Internal-Key"
+    }
+  },
+  "response_format": "json",
+  "idempotency_key": "55555555-5555-4555-8555-555555555555",
+  "trace_id": "backend-trace-example",
+  "timeout_seconds": 300
+}
