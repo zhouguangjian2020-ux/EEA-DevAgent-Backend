@@ -72,15 +72,32 @@ def view(db, subject, row):
         function_id=row["function_id"], artifact_id=row["artifact_id"], revision_id=row["revision_id"],
         error_code="attempt_interrupted" if state == "interrupted" else row["error_code"],
         saved_as="pending" if state == "saved" else None,
+        original_message=row.get("prompt"),
+        new_function_name=(row.get("choice") or {}).get("name"),
+        target_function_id=(row.get("choice") or {}).get("function_id"),
     )
 
 
-def read_intent(subject, project_id, intent_id):
+def assert_intent_thread(db, row, thread_id):
+    if thread_id is None:
+        return
+    if not db.execute("SELECT to_regclass('ee.chat_tasks') AS present").fetchone()['present']:
+        fail(503, "task_schema_unavailable", "当前数据库尚未安装会话任务记录增量")
+    task = db.execute("""SELECT id FROM ee.chat_tasks WHERE project_id=%s AND user_id=%s
+        AND client_request_id=%s AND thread_id=%s AND task_kind='PRD'""",
+        (row['project_id'], row['user_id'], row['client_request_id'], thread_id)).fetchone()
+    if not task:
+        fail(404, "prd_creation_not_found", "原任务不属于当前会话，未恢复或重新执行")
+
+
+def read_intent(subject, project_id, intent_id, thread_id=None):
     with read_db() as db:
-        return view(db, subject, owned(db, subject, project_id, intent_id))
+        row = owned(db, subject, project_id, intent_id)
+        assert_intent_thread(db, row, thread_id)
+        return view(db, subject, row)
 
 
-def find_intent(subject, project_id, client_request_id):
+def find_intent(subject, project_id, client_request_id, thread_id=None):
     """Recover a lost initial response using the caller's existing request key."""
     with read_db() as db:
         actor = visible(db, subject, project_id)
@@ -88,6 +105,7 @@ def find_intent(subject, project_id, client_request_id):
                          (project_id, actor, client_request_id)).fetchone()
         if not row:
             fail(404, "prd_creation_not_found", "尚未找到本次请求的创建记录，请保留原请求标识")
+        assert_intent_thread(db, row, thread_id)
         return view(db, subject, row)
 
 
@@ -96,7 +114,8 @@ def prepare_plan(subject, project_id, payload):
         actor = visible(db, subject, project_id)
         lock_project(db, project_id)
         visible(db, subject, project_id)
-        request_hash = digest(payload.model_dump(mode="json", exclude={"thread_id"}))
+        request_hash = digest(payload.model_dump(mode="json", exclude={"thread_id"} |
+            {field for field in ("target_function_id", "new_function_name") if not getattr(payload, field, None)}))
         prior = db.execute("SELECT * FROM ee.prd_creation_intents WHERE project_id=%s AND user_id=%s AND client_request_id=%s FOR UPDATE",
                            (project_id, actor, payload.client_request_id)).fetchone()
         if prior:
@@ -110,6 +129,36 @@ def prepare_plan(subject, project_id, payload):
             VALUES(%s,%s,%s,%s,%s,%s,'planning',%s,%s,%s,%s,now()+(%s * interval '1 second')) RETURNING *""",
             (uuid4(), project_id, actor, payload.client_request_id, request_hash, payload.message,
              uuid4(), uuid4(), uuid4(), uuid4(), lease_seconds())).fetchone()
+        explicit_name = getattr(payload, "new_function_name", None)
+        if explicit_name:
+            authorize(db, subject, project_id, "function.create")
+            authorize(db, subject, project_id, "PRD.create")
+            from app.services.function_names import normalize_name
+            row = db.execute("UPDATE ee.prd_creation_intents SET choice=%s WHERE id=%s RETURNING *",
+                             (Jsonb({"action": "create", "name": explicit_name}), row["id"])).fetchone()
+            snapshot = planning.planning_snapshot_in_db(db, subject, project_id)
+            if any(normalize_name(f["name"]) == normalize_name(explicit_name) for f in snapshot.functions):
+                row = db.execute("""UPDATE ee.prd_creation_intents SET state='blocked',version=version+1,
+                    error_code='function_name_conflict',lease_token=NULL,lease_until=NULL
+                    WHERE id=%s RETURNING *""", (row["id"],)).fetchone()
+                return row, False
+        target = getattr(payload, "target_function_id", None)
+        if target is not None:
+            # The user chooses an ID, not an Agent-generated candidate. Membership,
+            # access and uniqueness are checked while holding the project lock.
+            authorize(db, subject, project_id, "PRD.create", function_id=target)
+            lock_function(db, project_id, target)
+            context, _ = source_context(db, project_id, target)
+            definition = FeatureDefinition(name=context.function_name, description=context.function_description,
+                                           description_source="saved_function")
+            choice = {"action": "reuse", "function_id": str(target)}
+            row = db.execute("""UPDATE ee.prd_creation_intents SET definition=%s,choice=%s,
+                state='planned',version=version+1,lease_token=NULL,lease_until=NULL WHERE id=%s RETURNING *""",
+                (Jsonb(definition.model_dump()), Jsonb(choice), row["id"])).fetchone()
+            prd = existing_prd(db, project_id, target)
+            if prd:
+                block_existing(db, row, target, prd, choice)
+            return row, False
         return row, True
 
 
@@ -232,7 +281,8 @@ def prepare_generation(subject, project_id, intent_id, payload, request_id):
                 error_code=NULL,lease_token=%s,lease_until=now()+(%s * interval '1 second'),updated_at=now()
                 WHERE id=%s RETURNING *""", (uuid4(), lease_seconds(), row["id"])).fetchone()
             return row, "plan"
-        choice = canonical_choice(payload, row["definition"])
+        choice = (row["choice"] if payload.action == "auto" and row["choice"]
+                  else canonical_choice(payload, row["definition"]))
         if row["choice"] and choice is not None and choice != row["choice"]:
             fail(409, "prd_creation_choice_conflict", "此创建记录已绑定原功能，不能更换目标或名称")
         if row["state"] in ("saved", "blocked") or active(row):
@@ -241,25 +291,31 @@ def prepare_generation(subject, project_id, intent_id, payload, request_id):
             return row, None  # lost response replay: only return current receipt
         function_id = row["function_id"]
         if function_id is None:
+            choice = choice or row["choice"]
             if choice is None:
                 fail(409, "prd_choice_required", "请明确选择新建或复用功能")
             snapshot = planning.planning_snapshot_in_db(db, subject, project_id)
             definition = FeatureDefinition.model_validate(row["definition"])
-            if payload.action == "auto" and planning.match_candidates(definition, snapshot.functions):
-                return row, None  # concurrent new candidates require explicit human selection
             if choice["action"] == "reuse":
-                candidates = planning.match_candidates(definition, snapshot.functions)
-                candidate = next((c for c in candidates if str(c.function_id) == choice["function_id"]), None)
+                candidate = next((f for f in snapshot.functions if str(f["id"]) == choice["function_id"]), None)
                 if not candidate:
-                    fail(409, "prd_candidate_changed", "候选已变化或不属于当前项目，请重新核对，未创建对象")
-                function_id = candidate.function_id
+                    fail(409, "prd_candidate_changed", "功能已删除或不属于当前项目，未创建对象")
+                function_id = candidate["id"]
                 authorize(db, subject, project_id, "PRD.create", function_id=function_id)
                 lock_function(db, project_id, function_id)
-                if candidate.prd_artifact_id:
+                if candidate["prd_artifact_id"]:
                     block_existing(db, row, function_id, existing_prd(db, project_id, function_id), choice)
                     return row, None
             else:
                 authorize(db, subject, project_id, "PRD.create")
+                authorize(db, subject, project_id, "function.create")
+                from app.services.function_names import normalize_name
+                if any(normalize_name(f["name"]) == normalize_name(choice["name"]) for f in snapshot.functions):
+                    # No implicit reuse or rename, including an existing function without a PRD.
+                    row = db.execute("""UPDATE ee.prd_creation_intents SET state='blocked',version=version+1,
+                        error_code='function_name_conflict',lease_token=NULL,lease_until=NULL
+                        WHERE id=%s RETURNING *""", (row["id"],)).fetchone()
+                    return row, None
                 result = manual_work.create_function_in_db(db, subject, project_id,
                     FunctionCreate(creation_id=row["reserved_function_id"], name=choice["name"], description=definition.description), request_id)
                 function_id = result.function_id
@@ -283,7 +339,7 @@ def finish_generation(subject, original, markdown, request_id):
         row = attempt_row(db, subject, original)
         authorize(db, subject, row["project_id"], "PRD.create", function_id=row["function_id"])
         lock_function(db, row["project_id"], row["function_id"])
-        _, current_hash = source_context(db, row["project_id"], row["function_id"])
+        current_context, current_hash = source_context(db, row["project_id"], row["function_id"])
         if current_hash != row["source_hash"]:
             fail(409, "prd_source_changed", "生成功能资料已变化，旧结果未保存；可使用同一功能重新生成")
         prd = existing_prd(db, row["project_id"], row["function_id"])
@@ -291,7 +347,7 @@ def finish_generation(subject, original, markdown, request_id):
             block_existing(db, row, row["function_id"], prd)
             return
         result = manual_work.create_artifact_in_db(db, subject, row["project_id"], row["function_id"],
-            PrdCreate(kind="PRD", creation_id=row["reserved_artifact_id"], name=row["definition"]["name"]), request_id,
+            PrdCreate(kind="PRD", creation_id=row["reserved_artifact_id"], name=current_context.function_name), request_id,
             initial_revision_id=row["reserved_revision_id"], initial_prd_content=content,
             creation_metadata={"prd_creation_intent_id": str(row["id"])})
         db.execute("""UPDATE ee.prd_creation_intents SET state='saved',version=version+1,artifact_id=%s,
@@ -322,6 +378,7 @@ async def _execute_intent(subject, project_id, intent_id, payload, request_id, p
             fail(502, "agent_invalid_response", "Agent未返回完整有效PRD，功能已保留")
         await progress.advance("saving")
         await asyncio.to_thread(finish_generation, subject, row, output.strip(), request_id)
+        progress.observe_completion()
     except asyncio.CancelledError:
         await asyncio.shield(record_failure(row, "attempt_interrupted"))
         raise

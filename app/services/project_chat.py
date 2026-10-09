@@ -3,6 +3,7 @@ import json
 from uuid import uuid4
 from psycopg.types.json import Jsonb
 from app.services.manual_work import write_transaction
+from app.services import task_timing
 from app.services.workflow_sources import read_db, visible, object_content, digest, fail, allowed
 
 def owned(db,subject,project_id,thread_id,lock=False):
@@ -38,7 +39,10 @@ def create_thread(subject,project_id,payload):
 def history(subject,project_id,thread_id):
     with read_db() as db:
         t=owned(db,subject,project_id,thread_id)
-        rows=db.execute('SELECT client_request_id,prompt,body,status,attachments,created_at,updated_at FROM ee.chat_turns WHERE thread_id=%s ORDER BY created_at,id LIMIT 101',(thread_id,)).fetchall()
+        rows=db.execute("""SELECT client_request_id,prompt,body,status,attachments,created_at,updated_at,
+            to_jsonb(t)->'duration_ms' AS duration_ms FROM ee.chat_turns t
+            WHERE thread_id=%s ORDER BY created_at,id LIMIT 101""",(thread_id,)).fetchall()
+        rows=[{**row,'duration_ms':task_timing.duration_value(row.get('duration_ms'),row.get('status',''))} for row in rows]
         return {'thread':{**t,'title':first_question_title(rows[0]['prompt'] if rows else None,t['title'])},'turns':rows}
 
 def start_turn(subject,project_id,thread_id,payload):
@@ -69,18 +73,40 @@ def start_turn(subject,project_id,thread_id,payload):
         context={'project_id':str(project_id),'thread_id':str(thread_id),'messages':messages,
                  'attachments':attachments,'task_receipts':context_in_db(db,subject,project_id,thread_id)}
         if len(json.dumps(context,ensure_ascii=False).encode())>1_500_000:fail(413,'context_too_large','会话上下文过大，请新建会话；未截断历史')
+        enabled = task_timing.has_columns(previous) if previous else task_timing.schema_available(db, 'ee.chat_turns')
+        timing = task_timing.new_attempt() if enabled else {}
         if previous:
-            db.execute("UPDATE ee.chat_turns SET status='running',body='',updated_at=now() WHERE thread_id=%s AND client_request_id=%s", (thread_id,payload.client_request_id))
+            clause, values = task_timing.update_part(timing)
+            db.execute(f"UPDATE ee.chat_turns SET status='running',body='',updated_at=now(){clause} WHERE thread_id=%s AND client_request_id=%s",
+                       (*values,thread_id,payload.client_request_id))
         else:
-            db.execute("INSERT INTO ee.chat_turns(id,thread_id,client_request_id,request_hash,prompt,mode,attachments,status) VALUES(%s,%s,%s,%s,%s,%s,%s,'running')",(uuid4(),thread_id,payload.client_request_id,fp,payload.message,payload.mode,Jsonb(attachments)))
+            columns, placeholders, values = task_timing.insert_parts(timing)
+            db.execute(f"INSERT INTO ee.chat_turns(id,thread_id,client_request_id,request_hash,prompt,mode,attachments,status{columns}) VALUES(%s,%s,%s,%s,%s,%s,%s,'running'{placeholders})",
+                       (uuid4(),thread_id,payload.client_request_id,fp,payload.message,payload.mode,Jsonb(attachments),*values))
         db.execute('UPDATE ee.chat_threads SET updated_at=now() WHERE id=%s',(thread_id,))
-        return {'replay':False,'context':context}
+        return {'replay':False,'context':context,'attempt_id':timing.get('attempt_id')}
 
-def finish_turn(subject,project_id,thread_id,client_request_id,body,status):
+def finish_turn(subject,project_id,thread_id,client_request_id,body,status,*,expected_attempt_id=None):
+    if status not in {'completed','failed','interrupted'}:
+        raise ValueError('Unsupported terminal turn status')
     with write_transaction() as db:
         owned(db,subject,project_id,thread_id,True)
-        db.execute("UPDATE ee.chat_turns SET body=%s,status=%s,updated_at=now() WHERE thread_id=%s AND client_request_id=%s AND status='running'",(body,status,thread_id,client_request_id))
+        row=db.execute('SELECT * FROM ee.chat_turns WHERE thread_id=%s AND client_request_id=%s FOR UPDATE',
+                       (thread_id,client_request_id)).fetchone()
+        if not row or row.get('attempt_id') != expected_attempt_id:
+            fail(409,'turn_observation_stale','较早请求不能覆盖当前重试的回复')
+        if row['status'] != 'running':
+            if row['status'] == status and row['body'] == body:
+                return {'duration_ms':task_timing.duration_value(row.get('duration_ms'),status)}
+            fail(409,'turn_observation_stale','原请求已结束，不能覆盖其回复')
+        timing=task_timing.completion(row,task_timing.utcnow(),expected_attempt_id) if status!='interrupted' else {}
+        clause,values=task_timing.update_part(timing)
+        changed=db.execute(f"UPDATE ee.chat_turns SET body=%s,status=%s,updated_at=now(){clause} WHERE thread_id=%s AND client_request_id=%s AND status='running' RETURNING *",
+                           (body,status,*values,thread_id,client_request_id)).fetchone()
+        if not changed:
+            fail(409,'turn_observation_stale','原请求状态已改变，不能标记完成')
         db.execute('UPDATE ee.chat_threads SET updated_at=now() WHERE id=%s',(thread_id,))
+        return {'duration_ms':task_timing.duration_value(changed.get('duration_ms'),status)}
 
 
 def authorize_modifications(subject,project_id,attachments):

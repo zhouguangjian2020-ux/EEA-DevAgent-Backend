@@ -12,3 +12,12 @@ artifacts/
 *.log
 *.gz
 *.zip
+
+# Ignore all private environment variants; keep the existing public template.
+.env.*
+!.env.example
+
+# Non-runtime materials are maintained outside this code repository.
+/docs/
+/tests/
+/pytest.ini

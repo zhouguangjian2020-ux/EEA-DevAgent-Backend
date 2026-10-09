@@ -2,8 +2,9 @@
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 
-from app.services import chat_tasks
+from app.services import chat_tasks, task_timing
 
 log = logging.getLogger(__name__)
 
@@ -13,13 +14,15 @@ class TaskProgress:
     subject: str
     project_id: object
     row: dict | None
+    completion_at: datetime | None = None
 
     @classmethod
     async def begin(cls, subject, project_id, payload, kind, function_id=None):
         thread = getattr(payload, 'thread_id', None)
         row = None
         if thread is not None:
-            source = payload.model_dump(mode='json', exclude={'thread_id'})
+            source = payload.model_dump(mode='json', exclude={'thread_id'} |
+                {field for field in ('target_function_id', 'new_function_name') if not getattr(payload, field, None)})
             # Strict before starting paid/work-producing requests: never silently lose ownership.
             row = await asyncio.to_thread(chat_tasks.begin, subject, project_id, thread,
                 payload.client_request_id, kind, source, function_id)
@@ -50,8 +53,15 @@ class TaskProgress:
         await self._record(chat_tasks.advance, stage, status, function_id=function_id,
             retry=retry, expected_updated_at=self.row['updated_at'])
 
+    def observe_completion(self):
+        # Called only after an actual successful execution, never on cached read/replay.
+        self.completion_at = task_timing.utcnow()
+
     async def saved(self):
-        await self._record(chat_tasks.complete_saved)
+        if self.row is None:
+            return
+        await self._record(chat_tasks.complete_saved, observed_at=self.completion_at,
+            expected_attempt_id=self.row.get('attempt_id'))
 
     async def preview(self, count, receipt_id):
         if self.row is None:
@@ -73,6 +83,6 @@ class TaskProgress:
         elif result.status == 'planned':
             await self.advance('awaiting_choice', 'waiting_choice')
         elif result.status in {'failed', 'interrupted', 'blocked'}:
-            await self.failed(uncertain=result.status != 'failed')
+            await self.failed(uncertain=result.status == 'interrupted')
         elif result.status in {'planning', 'generating'}:
             await self.advance(result.status, function_id=result.function_id)

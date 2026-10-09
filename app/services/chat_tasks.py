@@ -6,6 +6,7 @@ from psycopg.types.json import Jsonb
 from app.services.manual_work import write_transaction
 from app.services.workflow_sources import allowed, digest, fail, read_db, visible
 from app.services.projects import ProjectReadError
+from app.services import task_timing
 
 MAX_CONTEXT_TASKS = 100
 PAGE_SIZE = 50
@@ -50,10 +51,12 @@ def begin(subject, project_id, thread_id, client_request_id, kind, source, funct
         if function_id and not db.execute('SELECT 1 FROM ee.business_functions WHERE id=%s AND project_id=%s AND archived_at IS NULL',
                                           (function_id, project_id)).fetchone():
             fail(404, 'function_not_found', '功能不存在或已删除')
-        return db.execute('''INSERT INTO ee.chat_tasks
-            (id,thread_id,project_id,user_id,client_request_id,request_hash,task_kind,stage,status,function_id)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,'starting','running',%s) RETURNING *''',
-            (uuid4(), thread_id, project_id, actor, client_request_id, request_hash, kind, function_id)).fetchone()
+        timing = task_timing.new_attempt() if task_timing.schema_available(db, 'ee.chat_tasks') else {}
+        columns, placeholders, values = task_timing.insert_parts(timing)
+        return db.execute(f'''INSERT INTO ee.chat_tasks
+            (id,thread_id,project_id,user_id,client_request_id,request_hash,task_kind,stage,status,function_id{columns})
+            VALUES(%s,%s,%s,%s,%s,%s,%s,'starting','running',%s{placeholders}) RETURNING *''',
+            (uuid4(), thread_id, project_id, actor, client_request_id, request_hash, kind, function_id, *values)).fetchone()
 
 
 def advance(subject, project_id, thread_id, client_request_id, stage, status='running', *, function_id=None,
@@ -86,9 +89,16 @@ def advance(subject, project_id, thread_id, client_request_id, stage, status='ru
             fail(404, 'function_not_found', '功能不存在或已删除')
         effective_function_id = function_id or row['function_id']
         _authorize_task(db, subject, project_id, row['task_kind'], effective_function_id)
-        return db.execute('''UPDATE ee.chat_tasks SET stage=%s,status=%s,function_id=coalesce(%s,function_id),
-            result_count=NULL,receipt_id=NULL,result_refs='[]'::jsonb,updated_at=now() WHERE id=%s RETURNING *''',
-            (stage, status, function_id, row['id'])).fetchone()
+        timing = {}
+        if task_timing.has_columns(row):
+            if retry and row['status'] in {'failed', 'needs_verification', 'preview'} and status in {'running', 'waiting_choice'}:
+                timing = task_timing.new_attempt()
+            elif status == 'failed':
+                timing = task_timing.completion(row, task_timing.utcnow(), row['attempt_id'])
+        clause, values = task_timing.update_part(timing)
+        return db.execute(f'''UPDATE ee.chat_tasks SET stage=%s,status=%s,function_id=coalesce(%s,function_id),
+            result_count=NULL,receipt_id=NULL,result_refs='[]'::jsonb,updated_at=now(){clause} WHERE id=%s RETURNING *''',
+            (stage, status, function_id, *values, row['id'])).fetchone()
 
 
 def finish_unstored(subject, project_id, thread_id, client_request_id, status, *, count=0, receipt_id=None, expected_updated_at=None):
@@ -116,12 +126,14 @@ def finish_unstored(subject, project_id, thread_id, client_request_id, status, *
             return row
         if row['status'] not in {'running', 'waiting_choice'}:
             fail(409, 'task_already_finished', '任务需要明确重试或已完成')
-        return db.execute('''UPDATE ee.chat_tasks SET stage=%s,status=%s,result_count=%s,receipt_id=%s,
-            updated_at=now() WHERE id=%s RETURNING *''',
-            (stage, status, count, receipt_id, row['id'])).fetchone()
+        timing = task_timing.completion(row, task_timing.utcnow(), row.get('attempt_id'))
+        clause, values = task_timing.update_part(timing)
+        return db.execute(f'''UPDATE ee.chat_tasks SET stage=%s,status=%s,result_count=%s,receipt_id=%s,
+            updated_at=now(){clause} WHERE id=%s RETURNING *''',
+            (stage, status, count, receipt_id, *values, row['id'])).fetchone()
 
 
-def complete_saved(subject, project_id, thread_id, client_request_id):
+def complete_saved(subject, project_id, thread_id, client_request_id, *, observed_at=None, expected_attempt_id=None):
     """Only a matching, committed PRD intent or UC/FR batch can prove success."""
     with write_transaction() as db:
         _thread(db, subject, project_id, thread_id, True)
@@ -129,6 +141,8 @@ def complete_saved(subject, project_id, thread_id, client_request_id):
                          (thread_id, client_request_id)).fetchone()
         if not row:
             fail(404, 'task_not_found', '任务记录不存在')
+        if expected_attempt_id is not None and row.get('attempt_id') != expected_attempt_id:
+            fail(409, 'task_observation_stale', '较早请求不能覆盖更新的任务状态')
         if row['status'] == 'succeeded':
             allowed(db, subject, project_id, row['function_id'],
                     _write_capability(row['task_kind'], row['function_id']))
@@ -194,9 +208,12 @@ def complete_saved(subject, project_id, thread_id, client_request_id):
                     or (row['task_kind'] == 'PRD' and
                         (evidence['metadata'] or {}).get('prd_creation_intent_id') != receipt_id)):
                 fail(409, 'task_receipt_mismatch', '回执对象已失效，不能标记生成成功')
-        return db.execute('''UPDATE ee.chat_tasks SET stage='completed',status='succeeded',function_id=%s,
-            result_count=%s,result_refs=%s,receipt_id=%s,updated_at=now() WHERE id=%s RETURNING *''',
-            (function_id, len(refs), Jsonb(refs), receipt_id, row['id'])).fetchone()
+        # A receipt-only reconciliation proves the result, not when an old execution ended.
+        timing = task_timing.completion(row, observed_at, expected_attempt_id)
+        clause, values = task_timing.update_part(timing)
+        return db.execute(f'''UPDATE ee.chat_tasks SET stage='completed',status='succeeded',function_id=%s,
+            result_count=%s,result_refs=%s,receipt_id=%s,updated_at=now(){clause} WHERE id=%s RETURNING *''',
+            (function_id, len(refs), Jsonb(refs), receipt_id, *values, row['id'])).fetchone()
 
 
 def _active_function(db, project_id, function_id):
@@ -295,13 +312,37 @@ def _safe(db, subject, project_id, row):
     # A deleted or mismatched result cannot be disclosed through its old count.
     summary_permitted = summary_permitted and len(verified_refs) == len(row['result_refs'])
     refs = verified_refs if permitted else []
-    return {'id': row['id'], 'client_request_id': row['client_request_id'], 'task_kind': row['task_kind'],
-            'stage': row['stage'], 'status': row['status'],
+    request_message = None
+    request_error_code = None
+    stage, status = row["stage"], row["status"]
+    if row['task_kind'] == 'PRD' and permitted:
+        # Legacy PRD previews have no creation intent. Only the original owner's
+        # creation prompt is returned; result bodies remain behind artifact ACLs.
+        if db.execute("SELECT to_regclass('ee.prd_creation_intents') AS present").fetchone()['present']:
+            intent = db.execute('''SELECT prompt,state,lease_until,error_code FROM ee.prd_creation_intents
+                WHERE project_id=%s AND user_id=%s AND client_request_id=%s''',
+                (project_id, row['user_id'], row['client_request_id'])).fetchone()
+            request_message = intent['prompt'] if intent else None
+            if intent:
+                request_error_code = intent['error_code']
+                if intent['state'] in ('planning', 'generating'):
+                    from datetime import datetime, timezone
+                    if intent['lease_until'] is None or intent['lease_until'] <= datetime.now(timezone.utc):
+                        stage, status = 'completed', 'needs_verification'
+                elif intent['state'] in ('failed', 'blocked'):
+                    stage, status = 'completed', 'failed'
+                elif intent['state'] == 'saved' and status != 'succeeded':
+                    # A lost task update is not proof that business saving failed.
+                    stage, status = 'completed', 'needs_verification'
+
+    return {'request_message': request_message, 'request_error_code': request_error_code, 'id': row['id'], 'client_request_id': row['client_request_id'], 'task_kind': row['task_kind'],
+            'stage': stage, 'status': status,
             'function_id': row['function_id'] if permitted else None,
             'result_count': row['result_count'] if summary_permitted else None, 'result_refs': refs,
             'result_available': permitted and bool(refs) and len(refs) == len(row['result_refs']),
             'unchanged': row['task_kind'] == 'UC_DIAGRAM' and str(row['receipt_id'] or '').startswith('unchanged:'),
-            'created_at': row['created_at'], 'updated_at': row['updated_at']}
+            'created_at': row['created_at'], 'updated_at': row['updated_at'],
+            'duration_ms': task_timing.duration_value(row.get('duration_ms'), status)}
 
 
 def list_tasks(subject, project_id, thread_id, offset=0):

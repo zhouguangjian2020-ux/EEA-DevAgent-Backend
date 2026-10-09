@@ -1,3 +1,11 @@
+<!-- 2026-10-09 repository material relocation -->
+Documentation, historical release materials, and test scripts were moved at the user's request to:
+E:/Git projects/EEA-DevAgent-support-20261009/
+Frontend materials: TS-frontend/; backend materials: TS-backend/.
+Tests are preserved, not deleted, but are no longer part of these code-only repositories.
+Historical test runners may depend on the original layout. Restore/review their paths in an isolated checkout before running them; do not point them at the company database.
+Read E:/Git projects/EEA-DevAgent-support-20261009/README.md before following historical paths below.
+This is repository organization only, not a new company deployment or additional acceptance result.
 # Backend Agent Rules
 
 ## Scope
@@ -84,7 +92,7 @@ Also verify `/health`, `/docs`, `/redoc`, login, `/me`, and logout manually, the
 ## 2026-09-28 staged CRUD authorization — stages 3 and 4 together
 
 - User explicitly started stage 3, then authorized continuing directly into stage 4 for joint acceptance. This supersedes the stage-2 stop rule only for sidebar single deletion, truthful allocation navigation/UI synchronization, and explicit-selection atomic batch deletion with focused local tests. Stop after stage 4; stage 5 is NOT authorized.
-- Do not update `E:/Git projects/TS-frontend/docs/current/25_工作交接_项目功能PRD_UC_FR_CRUD_20260928.md`. Maintain current interaction, progress and verification documents instead.
+- Do not update `E:/Git projects/EEA-DevAgent-support-20261009/TS-frontend/docs/current/25_工作交接_项目功能PRD_UC_FR_CRUD_20260928.md`. Maintain current interaction, progress and verification documents instead.
 - Keep the original local acceptance services (3000/8000/56430) untouched. Use isolated disposable databases or separate stage-3/4 preview ports. No company database, SSH, deployment, credential changes or edits to frozen SQL packages. No restore/recycle bin, permission administration, complete allocation CRUD or new Agent flows.
 
 
@@ -93,4 +101,4 @@ Also verify `/health`, `/docs`, `/redoc`, login, `/me`, and logout manually, the
 - User explicitly continued with “第五部分，继续” on 2026-09-28. This supersedes the prior stage-3/4 stop rule and authorizes stage 5 only: full local/isolated CRUD regression, browser/API verification, SQL package/hash/rollback-boundary review, and current execution-package documentation.
 - Keep the confirmed scope: project/function/PRD/UC/FR and FR-allocation deletion behavior, dependency guards, active head/accepted reference checks, PRD delete-then-new-ID creation, batch atomicity and failure recovery. Do not count complete FR-allocation create/edit/accept CRUD as implemented.
 - Do not connect to company databases, SSH, deploy, restart company services, change company credentials/configuration/bindings, modify frozen SQL packages, add permission administration, add restore/recycle-bin UI, or add new Agent flows. The user executes company materials and returns safe receipts for review.
-- Do not modify `E:/Git projects/TS-frontend/docs/current/25_工作交接_项目功能PRD_UC_FR_CRUD_20260928.md`. Stage 5 ends after the local/isolated evidence and documentation are delivered; stop and wait for final user acceptance.
+- Do not modify `E:/Git projects/EEA-DevAgent-support-20261009/TS-frontend/docs/current/25_工作交接_项目功能PRD_UC_FR_CRUD_20260928.md`. Stage 5 ends after the local/isolated evidence and documentation are delivered; stop and wait for final user acceptance.

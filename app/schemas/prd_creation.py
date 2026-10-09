@@ -20,12 +20,28 @@ class FeaturePlanRequest(BaseModel):
         return value
 
 
+class PrdCreationRequest(FeaturePlanRequest):
+    """Optional explicit target; absent means create a new function, never infer reuse."""
+    target_function_id: UUID | None = None
+    new_function_name: Annotated[str, StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=100)] | None = None
+
+    @model_validator(mode="after")
+    def target_shape(self):
+        if self.target_function_id is not None and self.new_function_name is not None:
+            raise ValueError("已有功能和新功能名称不能同时指定")
+        if self.new_function_name is not None:
+            import unicodedata
+            if any(unicodedata.category(c).startswith("C") and not c.isspace() for c in self.new_function_name):
+                raise ValueError("功能名称不能含控制字符")
+        return self
+
+
 class FeatureDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     name: str = Field(min_length=1, max_length=100)
     description: str = Field(min_length=1, max_length=2000)
-    description_source: Literal["agent_output"] = "agent_output"
+    description_source: Literal["agent_output", "saved_function"] = "agent_output"
 
 
 class FeatureCandidate(BaseModel):
@@ -94,3 +110,6 @@ class PrdCreationIntent(BaseModel):
     error_code: str | None = None
     # Never claim accepted: saving an immutable PRD revision does not confirm it.
     saved_as: Literal["pending"] | None = None
+    new_function_name: str | None = None
+    original_message: str | None = None
+    target_function_id: UUID | None = None

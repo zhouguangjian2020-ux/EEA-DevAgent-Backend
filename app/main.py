@@ -40,3 +40,8 @@ app.include_router(workflows.router, prefix='/v1/projects', tags=['workflows'])
 
 from app.api.routes import prd_creation
 app.include_router(prd_creation.router, prefix="/v1/projects", tags=["prd-creation"])
+
+
+# Outermost request timestamp; does not alter authentication or Agent payloads.
+from app.core.request_timing import RequestTimingMiddleware
+app.add_middleware(RequestTimingMiddleware)

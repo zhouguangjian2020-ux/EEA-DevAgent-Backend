@@ -148,6 +148,7 @@ class ThreadPage(BaseModel):
     next_offset: int | None
 
 class TurnRead(BaseModel):
+    duration_ms: Annotated[int | None, Field(strict=True, ge=0, le=9_007_199_254_740_991)] = None
     client_request_id: UUID
     prompt: str
     body: str
@@ -167,6 +168,9 @@ class TaskResultRef(BaseModel):
 
 
 class ChatTaskRead(BaseModel):
+    duration_ms: Annotated[int | None, Field(strict=True, ge=0, le=9_007_199_254_740_991)] = None
+    request_message: str | None = None
+    request_error_code: str | None = None
     id: UUID
     client_request_id: UUID
     task_kind: Literal['PRD', 'UC', 'FR', 'FR_ALLOCATION', 'UC_DIAGRAM']

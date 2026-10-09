@@ -1,3 +1,4 @@
+from app.services import task_timing
 import asyncio, json
 from uuid import UUID
 from fastapi import APIRouter, Depends, Cookie, HTTPException, Query
@@ -79,9 +80,11 @@ async def message_stream(project_id:UUID,thread_id:UUID,payload:ChatRequest,iden
         if state['replay']:
             t=state['turn']
             if t['body']:yield sse({'type':'token','content':t['body']})
-            yield sse({'type':'done','status':t['status'],'replayed':True} if t['status']=='completed' else {'type':'error','code':'previous_turn_incomplete','message':'原请求未完整完成；明确重试请复用原请求标识并设置retry=true'})
+            yield sse({'type':'done','status':t['status'],'replayed':True,'duration_ms':task_timing.duration_value(t.get('duration_ms'),t['status'])} if t['status']=='completed' else {'type':'error','code':'previous_turn_incomplete','message':'原请求未完整完成；明确重试请复用原请求标识并设置retry=true','duration_ms':task_timing.duration_value(t.get('duration_ms'),t['status'])})
             return
-        body='';status='interrupted';persisted=False
+        body='';status='interrupted';persisted=False;completion={}
+        async def persist(result_status):
+            return await asyncio.to_thread(project_chat.finish_turn,subject,project_id,thread_id,payload.client_request_id,body,result_status,expected_attempt_id=state.get('attempt_id'))
         try:
             context=state['context']
             mode=payload.mode
@@ -97,23 +100,29 @@ async def message_stream(project_id:UUID,thread_id:UUID,payload:ChatRequest,iden
             if mode=='modify':
                 changes=await workflow_agent.modifications(outgoing,context['attachments'])
                 body='AI修改建议（生成时未应用；后续采纳状态以对象版本为准）：'+json.dumps([{'artifact_id':c['artifact_id'],'content':c['content']} for c in changes],ensure_ascii=False)
-                await asyncio.to_thread(project_chat.finish_turn,subject,project_id,thread_id,payload.client_request_id,body,'completed')
+                completion=await persist('completed')
                 persisted=True;status='completed';yield sse({'type':'preview','changes':changes})
             else:
                 async for event in workflow_agent.chat_stream(outgoing):
                     if event['type']=='token':body+=event['content'];yield sse(event)
                 if not body.strip():raise ProjectReadError(502,'agent_empty_response','Agent未返回内容')
-                await asyncio.to_thread(project_chat.finish_turn,subject,project_id,thread_id,payload.client_request_id,body,'completed')
+                completion=await persist('completed')
                 persisted=True;status='completed'
-            yield sse({'type':'done','thread_id':str(thread_id),'status':status})
+            yield sse({'type':'done','thread_id':str(thread_id),'status':status,'duration_ms':(completion or {}).get('duration_ms')})
         except asyncio.CancelledError:raise
         except ProjectReadError as e:
-            status='failed';yield sse({'type':'error','code':e.code,'message':e.message,'request_id':request_id})
+            status='failed'
+            try:completion=await asyncio.shield(persist(status));persisted=True
+            except Exception:completion={}
+            yield sse({'type':'error','code':e.code,'message':e.message,'request_id':request_id,'duration_ms':(completion or {}).get('duration_ms')})
         except Exception:
-            status='failed';yield sse({'type':'error','code':'chat_failed','message':'对话未完成，请保留输入并检查服务','request_id':request_id})
+            status='failed'
+            try:completion=await asyncio.shield(persist(status));persisted=True
+            except Exception:completion={}
+            yield sse({'type':'error','code':'chat_failed','message':'对话未完成，请保留输入并检查服务','request_id':request_id,'duration_ms':(completion or {}).get('duration_ms')})
         finally:
             if not persisted:
-                try:await asyncio.shield(asyncio.to_thread(project_chat.finish_turn,subject,project_id,thread_id,payload.client_request_id,body,status))
+                try:await asyncio.shield(persist(status))
                 except Exception:pass
     return StreamingResponse(events(),media_type='text/event-stream',headers={'Cache-Control':'no-store','X-Accel-Buffering':'no','X-Request-ID':request_id})
 

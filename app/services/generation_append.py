@@ -88,6 +88,8 @@ async def generate_and_append(subject, project_id, function_id, kind, payload, r
     except Exception:
         await progress.failed(uncertain=bool(progress.row and progress.row["stage"] == "saving"))
         raise
+    if not result.get('replayed', False):
+        progress.observe_completion()
     await progress.saved()  # commit() has exited its transaction before this proof check.
     return result
 
