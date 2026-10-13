@@ -22,7 +22,7 @@ from app.services.uc_template import UC_TEMPLATE_ID, UC_TEMPLATE_VERSION, UC_TEM
 UC_GENERATION_SCENE = "FROM_PRD_CREATE_UC"
 MAX_PRD_MARKDOWN_CHARACTERS = 200_000
 MAX_RESPONSE_BYTES = 1_000_000
-MAX_REFERENCE_DATA_BYTES = 1_200_000
+MAX_REFERENCE_DATA_BYTES = 512 * 1024
 MAX_CANDIDATES = 100
 
 UC_GENERATION_INSTRUCTION = """先使用配置在Agent服务端的业务后端地址和独立服务凭证，查询reference_data.uc_template.path所指定的UC模板。
@@ -200,6 +200,9 @@ def _parse_agent_candidates(raw: bytes) -> UcGenerationAgentResult:
     if not isinstance(payload, dict) or payload.get("scene") != UC_GENERATION_SCENE:
         raise UcGenerationError(502, "agent_invalid_response", "Agent返回场景不匹配，未生成UC")
 
+    if payload.get("error") is not None or payload.get("interrupt") is not None:
+        raise UcGenerationError(502, "agent_incomplete_result", "Agent执行失败或等待人工输入，未采纳生成结果")
+
     structured: Any = payload.get("structured")
     if structured is None:
         output = payload.get("output")
@@ -274,9 +277,15 @@ async def generate_uc_from_prd(
                 json=request_body,
             ) as response:
                 if response.status_code != 200:
-                    from app.core.diagnostic_http import capture_rejected_response
-                    await capture_rejected_response(response)
-                    raise _upstream_error(response)
+                    # Use the same bounded, allow-listed error envelope as FR.
+                    # Import lazily because the shared client uses our URL validator.
+                    from app.services.workflow_agent import reject_upstream
+                    try:
+                        await reject_upstream(response)
+                    except ProjectReadError as error:
+                        if error.code == "agent_upstream_rejected":
+                            raise _upstream_error(response) from error
+                        raise UcGenerationError(error.status, error.code, error.message) from error
                 raw = bytearray()
                 async for chunk in response.aiter_bytes():
                     raw.extend(chunk)

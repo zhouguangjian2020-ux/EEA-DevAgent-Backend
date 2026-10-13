@@ -6,6 +6,7 @@ import json
 import logging
 from typing import Any
 from uuid import UUID
+from urllib.parse import urlsplit
 
 import httpx
 import psycopg
@@ -214,6 +215,17 @@ def _translate_agent_error(error: AgentExpandError) -> PrdGenerationError:
     return PrdGenerationError(error.status, error.code, message)
 
 
+def _stream_agent_url() -> str:
+    """Use only the documented stream sibling; never change private settings."""
+    target = urlsplit(settings.agent_invoke_url.strip())
+    path = target.path.rstrip("/")
+    if path.endswith("/invoke"):
+        path += "/stream"
+    elif not path.endswith("/invoke/stream"):
+        raise PrdGenerationError(503, "agent_not_configured", "PRD流式服务地址不符合调用契约，请核对服务端配置。")
+    return target._replace(path=path).geturl()
+
+
 async def stream_prd_generation(
     context: PrdGenerationContext,
     *,
@@ -222,13 +234,20 @@ async def stream_prd_generation(
     original_prompt: str | None = None,
     idempotency_key: str | None = None,
     strict_completion: bool = False,
+    require_stream: bool = False,
 ) -> AsyncIterator[dict[str, Any]]:
-    """Yield safe token/done events; this function never writes a business object."""
+    """Read PRD token/done events without writing a business object.
+
+    Durable creation opts into require_stream and strict_completion: no ordinary
+    invoke fallback, no token-only success, and persistence only after valid done.
+    Legacy read-only preview callers retain their existing response compatibility.
+    """
     try:
         validate_agent_configuration()
     except AgentExpandError as error:
         raise _translate_agent_error(error) from error
 
+    target_url = _stream_agent_url() if require_stream else settings.agent_invoke_url
     request_body = build_prd_generation_request(context, version=version, request_id=request_id, original_prompt=original_prompt, idempotency_key=idempotency_key)
     token_parts: list[str] = []
     try:
@@ -236,9 +255,9 @@ async def stream_prd_generation(
             async with agent_client() as client:
                 async with client.stream(
                     "POST",
-                    settings.agent_invoke_url,
+                    target_url,
                     headers={
-                        "Accept": "text/event-stream, application/json",
+                        "Accept": "text/event-stream" if require_stream else "text/event-stream, application/json",
                         "X-API-Key": settings.agent_api_key.get_secret_value(),
                     },
                     json=request_body,
@@ -248,7 +267,10 @@ async def stream_prd_generation(
                         await capture_rejected_response(response)
                         raise _upstream_error(response)
                     content_type = response.headers.get("content-type", "").lower()
-                    if "text/event-stream" in content_type or "application/x-ndjson" in content_type:
+                    is_stream = "text/event-stream" in content_type or "application/x-ndjson" in content_type
+                    if require_stream and not is_stream:
+                        raise PrdGenerationError(502, "agent_invalid_response", "Agent未返回约定的PRD流式响应，未保存结果。")
+                    if is_stream:
                         done_event: dict[str, Any] | None = None
                         try:
                             async for event in _iter_stream_events(response):
@@ -280,6 +302,8 @@ async def stream_prd_generation(
                             raise PrdGenerationError(502, "agent_invalid_response", "Agent完成事件无效，PRD未保存")
                         output = done_event.get("output")
                         if not isinstance(output, str) or not output.strip():
+                            if strict_completion:
+                                raise PrdGenerationError(502, "agent_invalid_response", "Agent未返回完整PRD完成正文，未保存流式片段。")
                             output = "".join(token_parts)
                         if not output.strip() or len(output) > MAX_PRD_OUTPUT_CHARACTERS:
                             raise PrdGenerationError(502, "agent_invalid_response", "Agent 未返回有效 PRD Markdown，原输入已保留。")

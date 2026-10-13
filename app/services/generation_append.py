@@ -1,10 +1,14 @@
 # Atomic pending batches; receipts use existing metadata, no new tables.
 import asyncio
+import logging
+import re
 from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
 from pydantic import ValidationError
 from app.schemas.manual_work import UcCreate, FrCreate
 from app.services import manual_work as mw, workflow_agent, uc_generation
 from app.services.workflow_sources import context_in_db, object_content, digest, fail
+
+logger = logging.getLogger(__name__)
 
 def batch_id(subject, kind, request_id, index=0):
     return UUID(bytes=uuid5(NAMESPACE_URL, f'ts-generated-batch/v1/{subject}/{kind}/{request_id}/{index}').bytes, version=4)
@@ -85,7 +89,12 @@ async def generate_and_append(subject, project_id, function_id, kind, payload, r
     except asyncio.CancelledError:
         await asyncio.shield(progress.failed(uncertain=True))
         raise
-    except Exception:
+    except Exception as error:
+        # Bounded diagnostic identity only: never log prompts, responses or credentials.
+        code = getattr(error, "code", None)
+        safe_code = code if isinstance(code, str) and re.fullmatch(r"[a-z_]{1,80}", code) else "unexpected_error"
+        logger.warning("generation_append_failed kind=%s request_id=%s code=%s exception_type=%s",
+                       kind, payload.client_request_id, safe_code, type(error).__name__)
         await progress.failed(uncertain=bool(progress.row and progress.row["stage"] == "saving"))
         raise
     if not result.get('replayed', False):

@@ -190,3 +190,38 @@ class UcTemplateResponse(BaseModel):
     fields: list[UcTemplateField]
     candidate_schema: dict[str, object]
     instructions: list[str]
+
+
+class RequirementDiagramRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    scene: Literal["FROM_SS_ASSIGNMENT_CREATE_REQ_DIAGRAM"]
+    project_id: UUID
+    function_id: UUID
+    subsystem_id: UUID
+    client_request_id: UUID4
+
+
+class RequirementDiagramSource(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    project_id: UUID
+    function_id: UUID
+    subsystem_id: UUID
+    subsystem_name: str
+    allocation_count: int = Field(ge=0, le=100)
+    fr_count: int = Field(ge=0, le=100)
+
+
+class RequirementDiagramResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    generation_id: UUID
+    scene: Literal["FROM_SS_ASSIGNMENT_CREATE_REQ_DIAGRAM"]
+    status: Literal["empty", "succeeded"]
+    source: RequirementDiagramSource
+    source_version: str
+    markdown: str | None = None
+    diagram_format: Literal["mermaid"] | None = None
+    diagram_code: str | None = None
+    trace_id: str | None = None

@@ -30,6 +30,8 @@ async def allocation_generation(project_id:UUID,function_id:UUID,payload:Generat
     from app.services.task_progress import TaskProgress
     progress = None
     try:
+        from app.services.default_subsystems import prepare_allocation_catalogue
+        await call(prepare_allocation_catalogue, identity[0], project_id, function_id, identity[1])
         progress = await TaskProgress.begin(identity[0], project_id, payload, 'FR_ALLOCATION', function_id)
         await progress.advance('generating', retry=True)
         result = await workflow_agent.generate(identity[0],project_id,function_id,'FR',payload.client_request_id,identity[1])
@@ -105,6 +107,7 @@ async def message_stream(project_id:UUID,thread_id:UUID,payload:ChatRequest,iden
             else:
                 async for event in workflow_agent.chat_stream(outgoing):
                     if event['type']=='token':body+=event['content'];yield sse(event)
+                    elif event['type']=='replace':body=event['content'];yield sse(event)
                 if not body.strip():raise ProjectReadError(502,'agent_empty_response','Agent未返回内容')
                 completion=await persist('completed')
                 persisted=True;status='completed'

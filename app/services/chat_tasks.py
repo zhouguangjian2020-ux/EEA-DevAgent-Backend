@@ -314,6 +314,14 @@ def _safe(db, subject, project_id, row):
     refs = verified_refs if permitted else []
     request_message = None
     request_error_code = None
+    request_function_name = None
+    # Own task context is distinct from generated-content access. Producers may
+    # see the active function's display name, but not its ID, refs or contents.
+    if row['task_kind'] in {'UC', 'FR', 'FR_ALLOCATION'} and _summary_readable(db, subject, project_id, row):
+        function = db.execute(
+            'SELECT name FROM ee.business_functions WHERE id=%s AND project_id=%s AND archived_at IS NULL',
+            (row['function_id'], project_id)).fetchone()
+        request_function_name = function['name'] if function else None
     stage, status = row["stage"], row["status"]
     if row['task_kind'] == 'PRD' and permitted:
         # Legacy PRD previews have no creation intent. Only the original owner's
@@ -335,7 +343,8 @@ def _safe(db, subject, project_id, row):
                     # A lost task update is not proof that business saving failed.
                     stage, status = 'completed', 'needs_verification'
 
-    return {'request_message': request_message, 'request_error_code': request_error_code, 'id': row['id'], 'client_request_id': row['client_request_id'], 'task_kind': row['task_kind'],
+    return {'request_message': request_message, 'request_error_code': request_error_code,
+            'request_function_name': request_function_name, 'id': row['id'], 'client_request_id': row['client_request_id'], 'task_kind': row['task_kind'],
             'stage': stage, 'status': status,
             'function_id': row['function_id'] if permitted else None,
             'result_count': row['result_count'] if summary_permitted else None, 'result_refs': refs,

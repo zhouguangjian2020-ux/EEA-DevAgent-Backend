@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     # Separate server-to-server credential used when Agent calls read-only backend contracts.
     agent_callback_key: SecretStr = SecretStr("")
     agent_timeout_seconds: float = Field(default=300, gt=0, le=300)
+    # FR batches may require longer than interactive Agent tasks.
+    agent_fr_timeout_seconds: float = Field(default=600, gt=0, le=600)
 
     # Opt-in diagnostics. Never reuse AGENT_API_KEY or SECRET_KEY here.
     diagnostics_enabled: bool = False

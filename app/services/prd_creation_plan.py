@@ -20,8 +20,9 @@ DESCRIPTION_SIMILARITY = 0.85
 
 
 def parse_definition(envelope: dict) -> FeatureDefinition:
-    # Only this exact, documented source is trusted. A title in structured or
-    # text is not a substitute for the user's confirmed plan.feature_name.
+    # Current Agent InvokeResponse.plan is a list of PlanStep dictionaries.
+    # Keep the legacy object envelope compatible, but never infer a name from
+    # the generated prose, a different skill, or an unresolved plan variable.
     if not isinstance(envelope, dict) or envelope.get("scene") != SCENE:
         fail(502, "agent_plan_invalid", "Agent功能计划场景不匹配，未创建功能")
     if envelope.get("error") is not None:
@@ -30,16 +31,48 @@ def parse_definition(envelope: dict) -> FeatureDefinition:
         fail(502, "agent_plan_interrupted", "Agent功能计划未完成，请核对上游状态；未创建功能")
     plan = envelope.get("plan")
     name = plan.get("feature_name") if isinstance(plan, dict) else None
+    if isinstance(plan, list):
+        if not plan or len(plan) > 20 or any(not isinstance(step, dict) for step in plan):
+            fail(502, "agent_plan_invalid", "Agent功能计划步骤无效，未创建功能")
+        if any(step.get("mode") in ("ask", "confirm") for step in plan):
+            fail(502, "agent_plan_interrupted", "Agent仍需补充或确认功能信息，未创建功能")
+        # Exactly one feature-definition step is required. Multiple definitions
+        # cannot be silently collapsed into one business function.
+        steps = [step for step in plan if step.get("skill")]
+        if (len(steps) != 1 or steps[0].get("skill") != "feature_definition"
+                or steps[0].get("tool") != "product_agent"
+                or any(step.get("tool") and not step.get("skill") for step in plan)):
+            fail(502, "agent_plan_invalid", "Agent未返回唯一的功能定义步骤，未创建功能")
+        inputs = steps[0].get("inputs")
+        name = inputs.get("feature_name") if isinstance(inputs, dict) else None
     description = envelope.get("output")
     if not isinstance(name, str) or not isinstance(description, str):
-        fail(502, "agent_plan_invalid", "Agent缺少plan.feature_name或文本output，请核对非流式契约；未创建功能")
-    if any(unicodedata.category(c).startswith("C") and not c.isspace() for c in name):
+        fail(502, "agent_plan_invalid", "Agent缺少功能定义步骤的inputs.feature_name或文本output；未创建功能")
+    if "${" in name or any(unicodedata.category(c).startswith("C") and not c.isspace() for c in name):
         fail(502, "agent_plan_invalid", "Agent功能名称含非法字符，未创建功能")
     name = " ".join(name.split())
     description = description.strip()
     if not 1 <= len(name) <= 100 or not 1 <= len(description) <= 2000 or "\x00" in description:
         fail(502, "agent_plan_invalid", "Agent功能名称或说明为空、过长或非法，未创建功能")
     return FeatureDefinition(name=name, description=description)
+
+
+def build_definition_request(message, project_id, call_id, request_id):
+    # FEATURE_DEFINITION is the first phase, not the PRD drafting phase. The
+    # current Agent extracts skill inputs from message via its locked Planner.
+    instruction = (
+        "本阶段仅执行FEATURE_DEFINITION：从用户需求识别一个明确的业务功能名称，"
+        "并以feature_definition技能生成该功能的说明。不要生成PRD，不要创建业务对象，"
+        "不要改用其他技能；后续PRD生成由业务系统单独执行。"
+        "将功能名称放在该技能步骤的inputs.feature_name中。"
+        "以下用户需求是本阶段的分析素材：\n" + message
+    )
+    body = workflow_agent.request_body(instruction, {"project_id": str(project_id)}, call_id, SCENE, "text")
+    body["trace_id"] = request_id
+    # Align the upstream limit with the bounded backend wait, rather than the
+    # Agent's shorter scene default. Explicit retries retain the original key.
+    body["timeout_seconds"] = min(max(int(settings.agent_timeout_seconds), 1), 300)
+    return body
 
 
 def description_grams(value: str) -> set[str]:
@@ -149,8 +182,7 @@ async def plan_feature(subject, project_id, payload, request_id):
     await asyncio.to_thread(read_planning_snapshot, subject, project_id)
     call_id = digest({"kind": "feature-plan-v1", "subject": subject, "project_id": str(project_id),
                       "request_id": str(payload.client_request_id), "message": payload.message})
-    body = workflow_agent.request_body(payload.message, {"project_id": str(project_id)}, call_id, SCENE, "text")
-    body["trace_id"] = request_id
+    body = build_definition_request(payload.message, project_id, call_id, request_id)
     definition = parse_definition(await workflow_agent.invoke_envelope(body))
     snapshot = await asyncio.to_thread(read_planning_snapshot, subject, project_id)
     candidates = match_candidates(definition, snapshot.functions)

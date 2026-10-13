@@ -202,8 +202,7 @@ async def record_failure(original, code):
 async def run_plan(subject, row, request_id):
     try:
         key = digest({"intent_id": str(row["id"]), "phase": "feature-plan-v1"})
-        body = workflow_agent.request_body(row["prompt"], {"project_id": str(row["project_id"])}, key, planning.SCENE, "text")
-        body["trace_id"] = request_id
+        body = planning.build_definition_request(row["prompt"], row["project_id"], key, request_id)
         definition = planning.parse_definition(await workflow_agent.invoke_envelope(body))
         await asyncio.to_thread(finish_plan, subject, row, definition)
     except asyncio.CancelledError:
@@ -369,7 +368,7 @@ async def _execute_intent(subject, project_id, intent_id, payload, request_id, p
         key = digest({"intent_id": str(row["id"]), "source_hash": row["source_hash"], "phase": "prd-v1"})
         output = None
         async for event in prd_generation.stream_prd_generation(work, version=None, request_id=request_id,
-                                                               original_prompt=row["prompt"], idempotency_key=key, strict_completion=True):
+                                                               original_prompt=row["prompt"], idempotency_key=key, strict_completion=True, require_stream=True):
             if event.get("type") == "done":
                 if event.get("scene") != prd_generation.PRD_GENERATION_SCENE:
                     fail(502, "agent_invalid_response", "PRD结果场景不匹配，未保存")

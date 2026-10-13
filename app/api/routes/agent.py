@@ -12,6 +12,8 @@ from app.core.config import settings
 from app.api.routes.auth import require_identity, require_user
 from app.schemas.agent import (
     AgentErrorResponse,
+    RequirementDiagramRequest,
+    RequirementDiagramResponse,
     PrdExpandRequest,
     PrdExpandResponse,
     PrdGenerationRequest,
@@ -47,6 +49,7 @@ from app.services.uc_generation import (
     read_confirmed_prd,
 )
 from app.services.uc_template import uc_template_response
+from app.services.requirement_diagram import generate_requirement_diagram
 
 router = APIRouter()
 
@@ -408,3 +411,27 @@ async def request_uc_diagram(
         diagram_code=result.diagram_code,
         trace_id=result.trace_id,
     )
+
+
+from app.schemas.agent import RequirementDiagramRequest, RequirementDiagramResponse
+from app.services.requirement_diagram import generate_requirement_diagram
+
+
+@router.post("/requirement-diagram", response_model=RequirementDiagramResponse,
+             summary="根据已保存分配生成所选子系统需求图（不保存或确认业务对象）",
+             responses={code: {"model": AgentErrorResponse} for code in (400, 401, 404, 409, 413, 502, 503, 504)})
+async def request_requirement_diagram(
+    payload: RequirementDiagramRequest, response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ts_session: str | None = Cookie(default=None),
+) -> RequirementDiagramResponse:
+    identity = require_identity(ts_session)
+    request_id = uuid.uuid4().hex
+    headers = {"X-Request-ID": request_id, "Cache-Control": "no-store"}
+    response.headers.update(headers)
+    if idempotency_key is not None and idempotency_key != str(payload.client_request_id):
+        raise HTTPException(status_code=400, detail={"code": "generation_request_id_mismatch", "message": "生成请求标识不一致", "request_id": request_id}, headers=headers)
+    try:
+        return RequirementDiagramResponse(**(await generate_requirement_diagram(identity.subject, payload, request_id)))
+    except ProjectReadError as error:
+        raise HTTPException(status_code=error.status, detail={"code": error.code, "message": error.message, "request_id": request_id}, headers=headers) from error

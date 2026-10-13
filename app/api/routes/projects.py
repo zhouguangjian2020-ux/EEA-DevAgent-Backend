@@ -90,8 +90,8 @@ def _create_subject(
 
 
 @router.post(
-    "", response_model=ProjectRead, status_code=201, summary="创建空项目并加入创建人",
-    description="需要Cookie、允许的Origin与X-Project-Request: 1。creation_id为UUIDv4，原样重试不重复创建。只初始化本人成员、项目角色和空子系统方案；业务写开关启用时授予项目需求维护者，否则仅阅读。",
+    "", response_model=ProjectRead, status_code=201, summary="创建项目并初始化默认子系统目录",
+    description="需要Cookie、允许的Origin与X-Project-Request: 1。creation_id为UUIDv4，原样重试不重复创建。同一事务初始化本人成员、项目角色和版本化默认子系统目录，不复制需求或分配；业务写开关启用时授予项目需求维护者，否则仅阅读。",
     responses={200: {"model": ProjectRead, "description": "安全重试，项目已存在"},
                **{code: {"model": ProjectErrorResponse} for code in (403, 409, 415, 503, 504)},
                401: {"description": "需要登录"}},

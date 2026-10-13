@@ -1,0 +1,20 @@
+# Build only source-controlled application inputs; never private runtime material.
+.git
+.env
+.env.*
+.venv
+node_modules
+.next
+.next-*
+__pycache__
+*.pyc
+.pytest_cache
+*.tsbuildinfo
+artifacts
+tmp
+docs
+tests
+deploy
+*.log
+*.tar.gz
+*.zip

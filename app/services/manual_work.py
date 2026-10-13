@@ -268,20 +268,26 @@ def save_revision(subject, project_id, artifact_id, payload: SaveRevision, reque
 
 def accept_revision(subject, project_id, artifact_id, payload: AcceptRevision, request_id):
     with write_transaction() as db:
-        # Require read access before looking up an object's type.
-        authorize(db,subject,project_id,"project.read")
-        lock_project(db,project_id)
-        row = artifact(db,project_id,artifact_id)
-        actor = authorize(db,subject,project_id,row["type_code"]+".accept", function_id=row["function_id"])
-        old = db.execute("SELECT revision_id,actor_id FROM ee.review_events WHERE artifact_id=%s AND request_key=%s", (artifact_id,str(payload.mutation_id))).fetchone()
-        if old:
-            if old["revision_id"] != payload.revision_id or old["actor_id"] != actor:
-                conflict("确认标识已被其他请求使用")
-            return WriteResult(function_id=row["function_id"],artifact_id=artifact_id,revision_id=payload.revision_id,created=False)
-        if row["head_revision_id"] != payload.revision_id:
-            conflict("仅能确认当前工作版本，请刷新核对")
-        # The narrow DB function runs existing R2 review/metadata/upstream guards atomically.
-        db.execute("SELECT ee.accept_manual_revision(%s,%s,%s,%s,%s)", (project_id,artifact_id,payload.revision_id,actor,str(payload.mutation_id)))
-        audit(db,project_id,actor,row["type_code"].lower()+".accept",request_id,row["function_id"],artifact_id)
-        return WriteResult(function_id=row["function_id"],artifact_id=artifact_id,revision_id=payload.revision_id)
+        return accept_revision_in_db(db, subject, project_id, artifact_id, payload, request_id)
+
+
+def accept_revision_in_db(db, subject, project_id, artifact_id, payload, request_id, *, expected_function=None, expected_kind=None):
+    # Require read access before looking up an object's type.
+    authorize(db,subject,project_id,"project.read")
+    lock_project(db,project_id)
+    row = artifact(db,project_id,artifact_id)
+    if expected_function is not None and (row["function_id"] != expected_function or row["type_code"] != expected_kind):
+        conflict("对象不属于当前功能或类型")
+    actor = authorize(db,subject,project_id,row["type_code"]+".accept", function_id=row["function_id"])
+    old = db.execute("SELECT revision_id,actor_id FROM ee.review_events WHERE artifact_id=%s AND request_key=%s", (artifact_id,str(payload.mutation_id))).fetchone()
+    if old:
+        if old["revision_id"] != payload.revision_id or old["actor_id"] != actor:
+            conflict("确认标识已被其他请求使用")
+        return WriteResult(function_id=row["function_id"],artifact_id=artifact_id,revision_id=payload.revision_id,created=False)
+    if row["head_revision_id"] != payload.revision_id:
+        conflict("仅能确认当前工作版本，请刷新核对")
+    # The narrow DB function runs existing R2 review/metadata/upstream guards atomically.
+    db.execute("SELECT ee.accept_manual_revision(%s,%s,%s,%s,%s)", (project_id,artifact_id,payload.revision_id,actor,str(payload.mutation_id)))
+    audit(db,project_id,actor,row["type_code"].lower()+".accept",request_id,row["function_id"],artifact_id)
+    return WriteResult(function_id=row["function_id"],artifact_id=artifact_id,revision_id=payload.revision_id)
 

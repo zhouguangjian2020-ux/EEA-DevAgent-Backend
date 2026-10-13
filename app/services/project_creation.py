@@ -1,4 +1,4 @@
-"""Create an empty project, own membership, read grant, empty scheme and audit atomically."""
+"""Create a project, membership, grants, default catalogue and audit atomically."""
 from uuid import uuid4
 
 import psycopg
@@ -9,6 +9,7 @@ from app.core.database import ProjectDatabaseNotConfigured, UnsafeProjectDatabas
 from app.core.project_write_database import project_write_connection
 from app.schemas.projects import ProjectCreate, ProjectRead
 from app.services.projects import ProjectReadError, _SELECT, project_read
+from app.services.default_subsystems import require_default_catalogue, initialize_default_catalogue
 
 _COLUMNS = "id, code, name, description, lock_version::text AS lock_version, created_at, updated_at"
 
@@ -69,6 +70,7 @@ def create_project(subject: str, payload: ProjectCreate, request_id: str) -> tup
                     role = None
             if not role:
                 raise ProjectReadError(503, "project_create_role_not_ready", "项目初始权限角色尚未就绪，请联系维护人员")
+            require_default_catalogue(db)
             row = db.execute(
                 "INSERT INTO ee.projects(id,code,name,description,created_by) VALUES(%s,%s,%s,%s,%s) "
                 "RETURNING " + _COLUMNS,
@@ -85,12 +87,13 @@ def create_project(subject: str, payload: ProjectCreate, request_id: str) -> tup
                 "INSERT INTO ee.project_subsystem_designs(project_id,name,created_by,updated_by) VALUES(%s,%s,%s,%s)",
                 (payload.creation_id, "子系统划分方案", actor, actor),
             )
+            catalogue = initialize_default_catalogue(db, payload.creation_id, actor, request_id)
             db.execute(
                 "INSERT INTO ee.security_audit_events(id,project_id,actor_id,subject_user_id,event_type,scope_kind,"
                 "after_state,reason,request_id) VALUES(%s,%s,%s,%s,'project.create','project',%s,%s,%s)",
                 (uuid4(), payload.creation_id, actor, actor,
-                 Jsonb({"code": code, "name": payload.name, "granted_role": role_code, "subsystem_scheme": "empty"}),
-                 "用户创建空项目；仅初始化本人成员、读取权限和空子系统方案", request_id),
+                 Jsonb({"code": code, "name": payload.name, "granted_role": role_code, "subsystem_scheme": "default", "subsystem_catalogue": catalogue}),
+                 "用户创建项目；初始化本人成员、项目权限及默认43项子系统目录，不复制需求或分配", request_id),
             )
             return project_read({
                 **row,
