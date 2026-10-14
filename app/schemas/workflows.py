@@ -2,6 +2,7 @@
 from typing import Annotated, Literal
 from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, UUID4, model_validator
+from app.core.workflow_limits import MAX_UC_BATCH_ITEMS, MAX_FR_BATCH_ITEMS
 from app.schemas.manual_work import FrContent, PrdContent, UcContent, UcSource
 
 Text = Annotated[str, StringConstraints(strict=True, max_length=20000)]
@@ -210,4 +211,10 @@ class GeneratedBatchResult(Input):
     source_version: str
     replayed: bool
     trace_id: str | None = None
-    items: list[GeneratedBatchItem] = Field(min_length=1, max_length=100)
+    items: list[GeneratedBatchItem] = Field(min_length=1, max_length=MAX_FR_BATCH_ITEMS, description="UC: at most 100 items; FR: at most 300 items.")
+
+    @model_validator(mode="after")
+    def bound_uc_items(self):
+        if self.kind == "UC" and len(self.items) > MAX_UC_BATCH_ITEMS:
+            raise ValueError(f"UC generation supports at most {MAX_UC_BATCH_ITEMS} items")
+        return self

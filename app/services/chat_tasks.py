@@ -3,6 +3,7 @@ from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
 
+from app.core.workflow_limits import MAX_UC_BATCH_ITEMS, MAX_FR_BATCH_ITEMS
 from app.services.manual_work import write_transaction
 from app.services.workflow_sources import allowed, digest, fail, read_db, visible
 from app.services.projects import ProjectReadError
@@ -104,7 +105,7 @@ def advance(subject, project_id, thread_id, client_request_id, stage, status='ru
 def finish_unstored(subject, project_id, thread_id, client_request_id, status, *, count=0, receipt_id=None, expected_updated_at=None):
     """Record a server-side preview or observed empty result, never a saved success."""
     if status == 'preview':
-        if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= 100 or not isinstance(receipt_id, str) or not 1 <= len(receipt_id) <= 120:
+        if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= MAX_FR_BATCH_ITEMS or not isinstance(receipt_id, str) or not 1 <= len(receipt_id) <= 120:
             raise ValueError('Preview requires a bounded count and server receipt')
         stage = 'review'
     elif status == 'empty':
@@ -122,6 +123,9 @@ def finish_unstored(subject, project_id, thread_id, client_request_id, status, *
         _authorize_task(db, subject, project_id, row['task_kind'], row['function_id'])
         if expected_updated_at is not None and row['updated_at'] != expected_updated_at:
             fail(409, 'task_observation_stale', '较早请求不能覆盖更新的任务状态')
+        limit = MAX_UC_BATCH_ITEMS if row['task_kind'] == 'UC' else MAX_FR_BATCH_ITEMS
+        if count > limit:
+            raise ValueError(f'Preview supports at most {limit} items for this task')
         if row['status'] == status and row['result_count'] == count and row['receipt_id'] == receipt_id:
             return row
         if row['status'] not in {'running', 'waiting_choice'}:
@@ -173,7 +177,8 @@ def complete_saved(subject, project_id, thread_id, client_request_id, *, observe
                     or result.get('kind') != row['task_kind']):
                 fail(409, 'task_receipt_missing', '尚无匹配的已提交生成回执')
             items = result.get('items')
-            if not isinstance(items, list) or not 1 <= len(items) <= 100:
+            limit = MAX_UC_BATCH_ITEMS if row['task_kind'] == 'UC' else MAX_FR_BATCH_ITEMS
+            if not isinstance(items, list) or not 1 <= len(items) <= limit:
                 fail(409, 'task_receipt_invalid', '生成回执数量或对象不完整')
             refs = []
             for index, item in enumerate(items):

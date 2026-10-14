@@ -4,6 +4,7 @@ import logging
 import re
 from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
 from pydantic import ValidationError
+from app.core.workflow_limits import MAX_UC_BATCH_ITEMS, MAX_FR_BATCH_ITEMS
 from app.schemas.manual_work import UcCreate, FrCreate
 from app.services import manual_work as mw, workflow_agent, uc_generation
 from app.services.workflow_sources import context_in_db, object_content, digest, fail
@@ -46,8 +47,9 @@ def prepare(subject, project_id, function_id, kind, payload):
         return (replay,None) if replay else (None,source_in_db(db,subject,project_id,function_id,kind,payload))
 
 def candidate_payloads(subject, kind, payload, candidates):
-    if not candidates or len(candidates)>100:
-        fail(502,'agent_invalid_response','生成结果必须包含1至100条有效对象')
+    limit = MAX_FR_BATCH_ITEMS if kind == "FR" else MAX_UC_BATCH_ITEMS
+    if not candidates or len(candidates) > limit:
+        fail(502,'agent_invalid_response',f'生成结果必须包含1至{limit}条有效对象')
     result=[]
     try:
         for i,candidate in enumerate(candidates):

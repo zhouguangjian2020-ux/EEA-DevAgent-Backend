@@ -2,6 +2,7 @@
 from typing import Literal
 from uuid import UUID
 from pydantic import Field, UUID4, model_validator
+from app.core.workflow_limits import MAX_UC_BATCH_ITEMS, MAX_FR_BATCH_ITEMS
 from app.schemas.manual_work import Input, AcceptRevision
 from app.schemas.workflows import AllocationSave
 
@@ -24,15 +25,17 @@ class AllocationReviewItem(Input):
 
 class ArtifactReviewBatch(Input):
     kind: Literal["UC", "FR"]
-    items: list[ArtifactReviewItem] = Field(min_length=1, max_length=100)
+    items: list[ArtifactReviewItem] = Field(min_length=1, max_length=MAX_FR_BATCH_ITEMS, description="UC: at most 100 items; FR: at most 300 items.")
 
     @model_validator(mode="after")
     def unique_items(self):
+        if self.kind == "UC" and len(self.items) > MAX_UC_BATCH_ITEMS:
+            raise ValueError(f"UC review supports at most {MAX_UC_BATCH_ITEMS} items")
         _unique(self.items, "artifact_id")
         return self
 
 class AllocationReviewBatch(Input):
-    items: list[AllocationReviewItem] = Field(min_length=1, max_length=100)
+    items: list[AllocationReviewItem] = Field(min_length=1, max_length=MAX_FR_BATCH_ITEMS)
 
     @model_validator(mode="after")
     def unique_items(self):

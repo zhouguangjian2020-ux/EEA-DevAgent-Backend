@@ -2,6 +2,7 @@
 import asyncio
 import json
 import re
+from app.core.workflow_limits import MAX_FR_BATCH_ITEMS
 from uuid import UUID
 
 from app.services.workflow_sources import read_db, visible, object_content, digest, fail
@@ -39,8 +40,8 @@ def read_source(subject: str, project_id: UUID, function_id: UUID, subsystem_id:
               AND a.archived_at IS NULL AND t.subsystem_id=%s
             ORDER BY a.id
         """, (project_id, function_id, subsystem_id)).fetchall()
-        if len(rows) > 100:
-            fail(413, "allocation_count_too_large", "子系统分配超过100条，请缩小范围；未截断数据")
+        if len(rows) > MAX_FR_BATCH_ITEMS:
+            fail(413, "allocation_count_too_large", f"子系统分配超过{MAX_FR_BATCH_ITEMS}条，请缩小范围；未截断数据")
         assignments = []
         for row in rows:
             fr = object_content(db, project_id, row["fr_id"], row["fr_revision_id"])

@@ -4,6 +4,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 import httpx
 from pydantic import ValidationError
 from app.core.config import settings
+from app.core.workflow_limits import MAX_FR_BATCH_ITEMS
 from app.schemas.workflows import FrCandidate, AllocationCandidate, Modification
 from app.services.agent import AgentExpandError, agent_client, _iter_stream_events
 from app.services.uc_generation import validate_generation_agent_configuration, UcGenerationError
@@ -120,10 +121,12 @@ async def invoke(body):
         fail(502, 'agent_invalid_response', 'Agent未返回约定的JSON对象')
 
 def validate_candidates(result,context,kind):
+    # kind names the source: UC -> FR candidates; FR -> allocation candidates.
+    # Both outputs use the FR limit; UC generation is validated separately.
     key='functional_requirements' if kind=='UC' else 'assignments'
     raw=result.get(key)
-    if set(result)!={key} or not isinstance(raw,list) or not raw or len(raw)>100:
-        fail(502,'agent_invalid_response','候选数组缺失、为空或超过100条')
+    if set(result)!={key} or not isinstance(raw,list) or not raw or len(raw)>MAX_FR_BATCH_ITEMS:
+        fail(502,'agent_invalid_response',f'候选数组缺失、为空或超过{MAX_FR_BATCH_ITEMS}条')
     source_pairs={(x['artifact_id'],x['revision_id']) for x in context['sources']}
     targets={x['subsystem_id'] for x in context['subsystems']}
     candidates=[];seen=set()
@@ -150,8 +153,8 @@ ALLOCATION_RETRY_DELAY_SECONDS = 0.5
 
 def allocation_batch_bodies(context, client_request_id, request_id):
     sources = context.get('sources')
-    if not isinstance(sources, list) or not sources or len(sources) > 100:
-        fail(409, 'allocation_source_count_invalid', 'FR分配要求1至100条已确认FR；未发起Agent调用')
+    if not isinstance(sources, list) or not sources or len(sources) > MAX_FR_BATCH_ITEMS:
+        fail(409, 'allocation_source_count_invalid', f'FR分配要求1至{MAX_FR_BATCH_ITEMS}条已确认FR；未发起Agent调用')
     version = digest(context)
     chunks = []
     current = []

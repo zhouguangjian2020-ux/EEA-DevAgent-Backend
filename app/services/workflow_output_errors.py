@@ -2,6 +2,7 @@
 import json
 import re
 
+from app.core.workflow_limits import MAX_FR_BATCH_ITEMS
 from app.services.projects import ProjectReadError
 
 _GENERIC = "Agent技能输出未通过校验，未保存生成结果"
@@ -20,8 +21,9 @@ def invalid_output_message(value: object) -> str:
     text = value.split("；原始文本", 1)[0]
     if "输出达到 token 上限" in text and "被截断" in text:
         return "Agent生成内容达到输出长度上限，JSON被截断；未保存任何生成结果"
-    if "functional_requirements 超过 100 条上限" in text:
-        return "Agent生成的FR超过单批100条上限；未保存任何生成结果，也未截断内容"
+    for limit in (100, MAX_FR_BATCH_ITEMS):
+        if f"functional_requirements 超过 {limit} 条上限" in text:
+            return f"Agent生成的FR超过单批{limit}条上限；未保存任何生成结果，也未截断内容"
     if "不在输入 reference_data.sources 中" in text:
         return "Agent生成的FR引用了不属于本次输入的UC或修订版本；未保存任何生成结果"
     if "无法解析为 JSON" in text:
