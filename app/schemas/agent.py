@@ -3,6 +3,8 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, UUID4, field_validator
 
+from app.core.workflow_limits import MAX_FR_BATCH_ITEMS
+
 
 class PrdExpandRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
@@ -209,8 +211,8 @@ class RequirementDiagramSource(BaseModel):
     function_id: UUID
     subsystem_id: UUID
     subsystem_name: str
-    allocation_count: int = Field(ge=0, le=100)
-    fr_count: int = Field(ge=0, le=100)
+    allocation_count: int = Field(ge=0, le=MAX_FR_BATCH_ITEMS)
+    fr_count: int = Field(ge=0, le=MAX_FR_BATCH_ITEMS)
 
 
 class RequirementDiagramResponse(BaseModel):

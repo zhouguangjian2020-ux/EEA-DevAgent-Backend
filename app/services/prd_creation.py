@@ -10,11 +10,13 @@ from uuid import uuid4
 from psycopg.types.json import Jsonb
 
 from app.core.config import settings
+from app.core.agent_limits import generation_timeout_seconds
 from app.schemas.manual_work import FunctionCreate, PrdContent, PrdCreate
 from app.schemas.prd_creation import FeatureDefinition, FeaturePlanReview, PrdCreationIntent
 from app.services import manual_work, prd_creation_plan as planning, prd_generation, workflow_agent
 from app.services.business_access import authorize
 from app.services.projects import ProjectReadError
+from app.services.prd_output_validation import validate_generated_prd
 from app.services.resource_locks import lock_project, lock_function
 from app.services.workflow_sources import digest, fail, read_db, visible
 
@@ -23,7 +25,7 @@ SELECT_INTENT = "SELECT * FROM ee.prd_creation_intents WHERE id=%s AND project_i
 
 
 def lease_seconds():
-    return max(1, float(settings.agent_timeout_seconds)) + 60
+    return max(1, generation_timeout_seconds()) + 60
 
 
 def active(row):
@@ -333,6 +335,7 @@ def prepare_generation(subject, project_id, intent_id, payload, request_id):
 
 
 def finish_generation(subject, original, markdown, request_id):
+    validate_generated_prd(markdown)
     content = PrdContent(kind="PRD", markdown_body=markdown)
     with manual_work.write_transaction() as db:
         row = attempt_row(db, subject, original)
@@ -375,6 +378,7 @@ async def _execute_intent(subject, project_id, intent_id, payload, request_id, p
                 output = event.get("output")
         if not isinstance(output, str) or not output.strip() or "\x00" in output or len(output) > 200000:
             fail(502, "agent_invalid_response", "Agent未返回完整有效PRD，功能已保留")
+        validate_generated_prd(output)
         await progress.advance("saving")
         await asyncio.to_thread(finish_generation, subject, row, output.strip(), request_id)
         progress.observe_completion()

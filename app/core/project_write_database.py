@@ -9,15 +9,22 @@ from app.core.database import ProjectDatabaseNotConfigured, UnsafeProjectDatabas
 
 
 @contextmanager
-def project_write_connection():
+def project_write_connection(*, read_only=False):
     dsn = settings.projects_write_database_url.get_secret_value().strip()
     if not dsn:
         raise ProjectDatabaseNotConfigured()
+    options = "-c statement_timeout=5000 -c lock_timeout=2000 -c idle_in_transaction_session_timeout=15000"
+    if read_only:
+        options += " -c default_transaction_read_only=on"
     with psycopg.connect(
         dsn, connect_timeout=settings.projects_connect_timeout_seconds,
-        options="-c statement_timeout=5000 -c lock_timeout=2000 -c idle_in_transaction_session_timeout=15000",
-        application_name="ts-business-write-api", row_factory=dict_row,
+        options=options,
+        application_name="ts-business-receipt-api" if read_only else "ts-business-write-api", row_factory=dict_row,
     ) as connection:
+        # Set before the very first query; the dedicated role remains checked.
+        if read_only:
+            connection.read_only = True
+            connection.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
         role = connection.execute(
             "SELECT current_user AS name, r.rolconfig, NOT r.rolcanlogin OR r.rolinherit OR "
             "r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls OR "

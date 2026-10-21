@@ -23,8 +23,12 @@ class Settings(BaseSettings):
     # Separate server-to-server credential used when Agent calls read-only backend contracts.
     agent_callback_key: SecretStr = SecretStr("")
     agent_timeout_seconds: float = Field(default=300, gt=0, le=300)
-    # FR batches may require longer than interactive Agent tasks.
-    agent_fr_timeout_seconds: float = Field(default=600, gt=0, le=600)
+    # Long object conversations use their own budget; quick tasks stay unchanged.
+    agent_conversation_timeout_seconds: float = Field(default=2000, gt=0, le=2000)
+    # Button-triggered PRD/UC and diagram generation, separate from prompt expansion.
+    agent_generation_timeout_seconds: float = Field(default=2000, gt=0, le=2000)
+    # Keep the deployed FR-specific setting for FR generation/allocation compatibility.
+    agent_fr_timeout_seconds: float = Field(default=2000, gt=0, le=2000)
 
     # Opt-in diagnostics. Never reuse AGENT_API_KEY or SECRET_KEY here.
     diagnostics_enabled: bool = False

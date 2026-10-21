@@ -71,7 +71,6 @@ def build_definition_request(message, project_id, call_id, request_id):
     body["trace_id"] = request_id
     # Align the upstream limit with the bounded backend wait, rather than the
     # Agent's shorter scene default. Explicit retries retain the original key.
-    body["timeout_seconds"] = min(max(int(settings.agent_timeout_seconds), 1), 300)
     return body
 
 

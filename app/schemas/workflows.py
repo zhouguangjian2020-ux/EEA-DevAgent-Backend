@@ -61,6 +61,8 @@ class ThreadCreate(Input):
     title: Annotated[str, StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=120)] = '新会话'
 
 class ChatRequest(Input):
+    # Opt-in single-turn answer/proposal protocol; legacy clients remain valid.
+    unified_conversation: bool = False
     auto_intent: bool = False
     retry: bool = False
     client_request_id: UUID4

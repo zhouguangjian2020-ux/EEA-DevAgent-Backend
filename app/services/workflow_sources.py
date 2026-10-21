@@ -5,7 +5,7 @@ import hashlib, json
 import psycopg
 from app.core.database import project_connection, ProjectDatabaseNotConfigured, UnsafeProjectDatabaseRole
 from app.services.projects import ProjectReadError, _SELECT
-from app.services.uc_generation import _database_error
+from app.services.project_read_errors import database_read_error
 
 def fail(status, code, message):
     raise ProjectReadError(status, code, message)
@@ -18,7 +18,7 @@ def read_db():
     except ProjectReadError:
         raise
     except (psycopg.Error, ProjectDatabaseNotConfigured, UnsafeProjectDatabaseRole) as error:
-        raise _database_error(error) from error
+        raise database_read_error(error) from error
 
 def visible(db, subject, project_id):
     if not db.execute(_SELECT + ' AND p.id=%s', (subject, project_id)).fetchone():

@@ -12,6 +12,7 @@ import httpx
 import psycopg
 
 from app.core.config import settings
+from app.core.agent_limits import generation_timeout_seconds, generation_timeout_budget
 from app.core.database import (
     ProjectDatabaseNotConfigured,
     UnsafeProjectDatabaseRole,
@@ -179,7 +180,7 @@ def build_prd_generation_request(
         "reference_data": reference_data,
         "response_format": "text",
         "trace_id": request_id,
-        "timeout_seconds": min(max(int(settings.agent_timeout_seconds), 1), 300),
+        "timeout_seconds": generation_timeout_budget(),
     }
 
     if idempotency_key is not None:
@@ -251,7 +252,7 @@ async def stream_prd_generation(
     request_body = build_prd_generation_request(context, version=version, request_id=request_id, original_prompt=original_prompt, idempotency_key=idempotency_key)
     token_parts: list[str] = []
     try:
-        async with asyncio.timeout(settings.agent_timeout_seconds):
+        async with asyncio.timeout(generation_timeout_seconds()):
             async with agent_client() as client:
                 async with client.stream(
                     "POST",
@@ -261,6 +262,7 @@ async def stream_prd_generation(
                         "X-API-Key": settings.agent_api_key.get_secret_value(),
                     },
                     json=request_body,
+                    timeout=httpx.Timeout(generation_timeout_seconds(), connect=5),
                 ) as response:
                     if response.status_code != 200:
                         from app.core.diagnostic_http import capture_rejected_response

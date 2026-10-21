@@ -244,26 +244,31 @@ def artifact(db, project_id, artifact_id):
 
 def save_revision(subject, project_id, artifact_id, payload: SaveRevision, request_id):
     with write_transaction() as db:
-        lock_project(db,project_id)
-        row = artifact(db,project_id,artifact_id)
-        actor = authorize(db,subject,project_id,payload.content.kind+".update", function_id=row["function_id"])
-        if row["type_code"] != payload.content.kind:
-            conflict("对象类型不匹配")
-        digest = fingerprint(project_id,row["function_id"],payload)
-        old = db.execute("SELECT * FROM ee.artifact_revisions WHERE id=%s", (payload.mutation_id,)).fetchone()
-        if old:
-            if old["artifact_id"] != artifact_id or old["created_by"] != actor or old["metadata"].get("manual_mutation_hash") != digest:
-                conflict("保存标识已被其他请求使用")
-            return WriteResult(function_id=row["function_id"],artifact_id=artifact_id,revision_id=old["id"],created=False)
-        if row["head_revision_id"] != payload.base_revision_id:
-            conflict("对象已有新版本，不能覆盖；请保留草稿并刷新核对")
-        prd = db.execute("SELECT prd_id FROM ee.use_cases WHERE artifact_id=%s", (artifact_id,)).fetchone() if payload.content.kind == "UC" else None
-        validate_sources(db,project_id,row["function_id"],payload.content,prd["prd_id"] if prd else None,payload.base_revision_id)
-        base = db.execute("SELECT revision_no,type_version_id FROM ee.artifact_revisions WHERE id=%s", (payload.base_revision_id,)).fetchone()
-        append_revision(db,project_id,row["function_id"],artifact_id,payload.mutation_id,actor,payload.content,base["type_version_id"],payload.base_revision_id,base["revision_no"]+1,digest)
-        db.execute("UPDATE ee.artifacts SET head_revision_id=%s WHERE id=%s", (payload.mutation_id,artifact_id))
-        audit(db,project_id,actor,row["type_code"].lower()+".update",request_id,row["function_id"],artifact_id)
-        return WriteResult(function_id=row["function_id"],artifact_id=artifact_id,revision_id=payload.mutation_id)
+        return save_revision_in_db(db, subject, project_id, artifact_id, payload, request_id)
+
+
+def save_revision_in_db(db, subject, project_id, artifact_id, payload: SaveRevision, request_id):
+    """Append a draft using the caller's transaction; never commit here."""
+    lock_project(db,project_id)
+    row = artifact(db,project_id,artifact_id)
+    actor = authorize(db,subject,project_id,payload.content.kind+".update", function_id=row["function_id"])
+    if row["type_code"] != payload.content.kind:
+        conflict("对象类型不匹配")
+    digest = fingerprint(project_id,row["function_id"],payload)
+    old = db.execute("SELECT * FROM ee.artifact_revisions WHERE id=%s", (payload.mutation_id,)).fetchone()
+    if old:
+        if old["artifact_id"] != artifact_id or old["created_by"] != actor or old["metadata"].get("manual_mutation_hash") != digest:
+            conflict("保存标识已被其他请求使用")
+        return WriteResult(function_id=row["function_id"],artifact_id=artifact_id,revision_id=old["id"],created=False)
+    if row["head_revision_id"] != payload.base_revision_id:
+        conflict("对象已有新版本，不能覆盖；请保留草稿并刷新核对")
+    prd = db.execute("SELECT prd_id FROM ee.use_cases WHERE artifact_id=%s", (artifact_id,)).fetchone() if payload.content.kind == "UC" else None
+    validate_sources(db,project_id,row["function_id"],payload.content,prd["prd_id"] if prd else None,payload.base_revision_id)
+    base = db.execute("SELECT revision_no,type_version_id FROM ee.artifact_revisions WHERE id=%s", (payload.base_revision_id,)).fetchone()
+    append_revision(db,project_id,row["function_id"],artifact_id,payload.mutation_id,actor,payload.content,base["type_version_id"],payload.base_revision_id,base["revision_no"]+1,digest)
+    db.execute("UPDATE ee.artifacts SET head_revision_id=%s WHERE id=%s", (payload.mutation_id,artifact_id))
+    audit(db,project_id,actor,row["type_code"].lower()+".update",request_id,row["function_id"],artifact_id)
+    return WriteResult(function_id=row["function_id"],artifact_id=artifact_id,revision_id=payload.mutation_id)
 
 
 def accept_revision(subject, project_id, artifact_id, payload: AcceptRevision, request_id):

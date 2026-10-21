@@ -1,21 +1,24 @@
 """Read a confirmed PRD and invoke the Agent for transient UC candidates."""
 from dataclasses import dataclass
+import asyncio
 import json
 from typing import Any
 from uuid import UUID, uuid4
-from urllib.parse import urlsplit
 
 import httpx
-import psycopg
 
 from app.core.config import settings
-from app.core.database import (
-    ProjectDatabaseNotConfigured,
-    UnsafeProjectDatabaseRole,
-    project_connection,
-)
+from app.core.agent_limits import generation_timeout_seconds, generation_timeout_budget
+from app.core.database import project_connection
 from app.schemas.agent import UcCandidateContent, UcGenerationCandidate
 from app.services.agent import agent_client
+from app.services.agent_configuration import (
+    AgentConfigurationError,
+    generation_agent_url,
+    validate_generation_agent_configuration as _validate_generation_agent_configuration,
+)
+from app.services.project_read_errors import database_read_error as _database_error
+from app.services.workflow_agent import reject_upstream
 from app.services.projects import ProjectReadError, _SELECT
 from app.services.uc_template import UC_TEMPLATE_ID, UC_TEMPLATE_VERSION, UC_TEMPLATE_PATH
 
@@ -55,16 +58,6 @@ class UcGenerationError(Exception):
         self.code = code
         self.message = message
         super().__init__(code)
-
-
-def _database_error(error: Exception) -> ProjectReadError:
-    if isinstance(error, ProjectDatabaseNotConfigured):
-        return ProjectReadError(503, "projects_not_configured", "项目数据库尚未配置")
-    if isinstance(error, UnsafeProjectDatabaseRole):
-        return ProjectReadError(503, "projects_unsafe_database_role", "项目接口需要专用低权限数据库账号")
-    if isinstance(error, (psycopg.errors.QueryCanceled, psycopg.errors.LockNotAvailable)):
-        return ProjectReadError(504, "projects_query_timeout", "项目查询超时，请稍后重试")
-    return ProjectReadError(503, "projects_database_unavailable", "项目数据库暂不可用")
 
 
 def read_confirmed_prd(
@@ -149,33 +142,12 @@ def read_confirmed_prd(
         raise _database_error(error) from error
 
 
-def generation_agent_url() -> str:
-    configured = settings.agent_generation_invoke_url.strip()
-    if configured:
-        return configured
-    configured = settings.agent_invoke_url.strip()
-    if configured.endswith("/stream"):
-        return configured[: -len("/stream")]
-    return configured
-
-
 def validate_generation_agent_configuration() -> str:
-    target_url = generation_agent_url()
+    """Retain the UC-facing exception contract while sharing endpoint validation."""
     try:
-        target = urlsplit(target_url)
-    except ValueError as error:
-        raise UcGenerationError(503, "agent_not_configured", "UC生成服务地址配置无效，请联系管理员") from error
-    if (
-        target.scheme not in {"http", "https"}
-        or not target.hostname
-        or target.username
-        or target.password
-        or target.query
-        or target.fragment
-        or not settings.agent_api_key.get_secret_value()
-    ):
-        raise UcGenerationError(503, "agent_not_configured", "UC生成服务尚未配置，请联系管理员")
-    return target_url
+        return _validate_generation_agent_configuration()
+    except AgentConfigurationError as error:
+        raise UcGenerationError(error.status, error.code, error.message) from error
 
 
 def _safe_trace_id(value: object) -> str | None:
@@ -264,10 +236,10 @@ async def generate_uc_from_prd(
         "response_format": "json",
         "idempotency_key": str(client_request_id),
         "trace_id": request_id,
-        "timeout_seconds": min(max(int(settings.agent_timeout_seconds), 1), 300),
+        "timeout_seconds": generation_timeout_budget(),
     }
     try:
-        async with agent_client() as client:
+        async with asyncio.timeout(generation_timeout_seconds()), agent_client() as client:
             async with client.stream(
                 "POST", target_url,
                 headers={
@@ -275,11 +247,10 @@ async def generate_uc_from_prd(
                     "X-API-Key": settings.agent_api_key.get_secret_value(),
                 },
                 json=request_body,
+                timeout=httpx.Timeout(generation_timeout_seconds(), connect=5),
             ) as response:
                 if response.status_code != 200:
                     # Use the same bounded, allow-listed error envelope as FR.
-                    # Import lazily because the shared client uses our URL validator.
-                    from app.services.workflow_agent import reject_upstream
                     try:
                         await reject_upstream(response)
                     except ProjectReadError as error:

@@ -1,5 +1,6 @@
 """Read accepted UC revisions and bridge them to the Agent diagram scene."""
 from dataclasses import dataclass
+import asyncio
 import hashlib
 import json
 import re
@@ -10,6 +11,7 @@ import httpx
 import psycopg
 
 from app.core.config import settings
+from app.core.agent_limits import generation_timeout_seconds, generation_timeout_budget
 from app.core.database import (
     ProjectDatabaseNotConfigured,
     UnsafeProjectDatabaseRole,
@@ -18,7 +20,7 @@ from app.core.database import (
 from app.services.agent import agent_client
 from app.services.uc_diagram_syntax import UC_DIAGRAM_CONTRACT, UcDiagramSyntaxError, normalize_uc_diagram
 from app.services.projects import ProjectReadError, _SELECT
-from app.services.uc_generation import UcGenerationError, validate_generation_agent_configuration
+from app.services.agent_configuration import AgentConfigurationError, validate_generation_agent_configuration
 
 UC_DIAGRAM_SCENE = "FROM_UC_CREATE_UC_DIAGRAM"
 MAX_UCS = 100
@@ -267,7 +269,7 @@ async def generate_uc_diagram(
 ) -> UcDiagramAgentResult:
     try:
         target_url = validate_generation_agent_configuration()
-    except UcGenerationError as error:
+    except AgentConfigurationError as error:
         raise UcDiagramError(error.status, error.code, error.message) from error
     uc_list = [uc.to_reference() for uc in source.ucs]
     reference_data = {
@@ -287,10 +289,10 @@ async def generate_uc_diagram(
         "response_format": "json",
         "idempotency_key": str(client_request_id),
         "trace_id": request_id,
-        "timeout_seconds": min(max(int(settings.agent_timeout_seconds), 1), 300),
+        "timeout_seconds": generation_timeout_budget(),
     }
     try:
-        async with agent_client() as client:
+        async with asyncio.timeout(generation_timeout_seconds()), agent_client() as client:
             async with client.stream(
                 "POST", target_url,
                 headers={
@@ -298,6 +300,7 @@ async def generate_uc_diagram(
                     "X-API-Key": settings.agent_api_key.get_secret_value(),
                 },
                 json=request_body,
+                timeout=httpx.Timeout(generation_timeout_seconds(), connect=5),
             ) as response:
                 if response.status_code != 200:
                     from app.core.diagnostic_http import capture_rejected_response
@@ -311,7 +314,7 @@ async def generate_uc_diagram(
                 return _parse_agent_diagram(bytes(raw))
     except UcDiagramError:
         raise
-    except UcGenerationError as error:
+    except AgentConfigurationError as error:
         raise UcDiagramError(error.status, error.code, error.message) from error
     except (TimeoutError, httpx.TimeoutException) as error:
         raise UcDiagramError(504, "agent_timeout", "Agent生成UC图超时，请稍后重试") from error

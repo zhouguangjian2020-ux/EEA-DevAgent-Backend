@@ -105,3 +105,11 @@ class WriteResult(BaseModel):
     artifact_id: UUID | None = None
     revision_id: UUID | None = None
     created: bool = True
+
+
+class AiReviewReceipt(BaseModel):
+    """A missing receipt is not proof that an in-flight write failed."""
+    status: Literal["confirmed", "not_found"]
+    artifact_id: UUID
+    function_id: UUID | None = None
+    revision_id: UUID | None = None

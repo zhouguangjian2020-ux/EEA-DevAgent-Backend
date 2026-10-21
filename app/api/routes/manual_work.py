@@ -1,11 +1,11 @@
 """Authenticated JSON mutations. Business checks and transactions stay in services."""
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Response
 
-from app.api.routes.projects import _create_subject
-from app.schemas.manual_work import AcceptRevision, CreateArtifact, FunctionCreate, SaveRevision, WriteResult
+from app.api.routes.projects import _authenticated_read, _create_subject
+from app.schemas.manual_work import AcceptRevision, AiReviewReceipt, CreateArtifact, FunctionCreate, SaveRevision, WriteResult
 from app.schemas.projects import ProjectErrorResponse
-from app.services import manual_work
+from app.services import manual_work, ai_review
 from app.schemas.batch_review import ArtifactReviewBatch, AllocationReviewBatch, BatchReviewResult
 from app.services import batch_review
 from app.services.projects import ProjectReadError
@@ -60,3 +60,13 @@ def batch_accept_artifacts(project_id: UUID, function_id: UUID, payload: Artifac
 @router.post("/{project_id}/functions/{function_id}/allocations/batch-accept", response_model=BatchReviewResult)
 def batch_accept_allocations(project_id: UUID, function_id: UUID, payload: AllocationReviewBatch, identity=Depends(_create_subject)):
     return execute_batch(identity, batch_review.accept_allocations, project_id, function_id, payload)
+
+
+@router.post("/{project_id}/artifacts/{artifact_id}/ai-review/accept", response_model=WriteResult, status_code=201)
+def accept_ai_review(project_id: UUID, artifact_id: UUID, payload: SaveRevision, response: Response, identity=Depends(_create_subject)):
+    return execute(response, identity, ai_review.accept_proposal, project_id, artifact_id, payload)
+
+
+@router.get("/{project_id}/artifacts/{artifact_id}/ai-review/{mutation_id}", response_model=AiReviewReceipt)
+def read_ai_review_receipt(project_id: UUID, artifact_id: UUID, mutation_id: UUID, response: Response, ts_session: str | None = Cookie(default=None)):
+    return _authenticated_read(response, ts_session, lambda subject: ai_review.receipt(subject, project_id, artifact_id, mutation_id))

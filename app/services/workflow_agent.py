@@ -1,13 +1,18 @@
 """Shared Agent protocol for the reviewed workflow batch. No business writes."""
-import asyncio, json, logging
+import asyncio, json, logging, math
 from uuid import NAMESPACE_URL, uuid4, uuid5
 import httpx
 from pydantic import ValidationError
 from app.core.config import settings
+from app.core.agent_limits import (
+    MAX_REFERENCE_BYTES, reference_bytes, GENERATION_SCENES, FR_GENERATION_SCENES,
+    generation_timeout_seconds, generation_timeout_budget,
+)
 from app.core.workflow_limits import MAX_FR_BATCH_ITEMS
 from app.schemas.workflows import FrCandidate, AllocationCandidate, Modification
 from app.services.agent import AgentExpandError, agent_client, _iter_stream_events
-from app.services.uc_generation import validate_generation_agent_configuration, UcGenerationError
+from app.services.agent_configuration import AgentConfigurationError, validate_generation_agent_configuration
+from app.services.chat_activity import ActivityStream
 from app.services.workflow_sources import fail, generation_context, digest
 from app.services.workflow_output_errors import (
     AgentOutputError, invalid_output_message, local_json_diagnostics,
@@ -18,14 +23,15 @@ from app.services.projects import ProjectReadError
 logger = logging.getLogger(__name__)
 
 MAX_BYTES=2_000_000
-# Agent capability_registry default; fail early instead of sending an oversized snapshot.
-MAX_REFERENCE_BYTES=512 * 1024
+# Agent capability_registry default is shared with conversation preflight.
 
 def request_body(message, reference_data, request_id, scene=None, response_format='json'):
-    if len(json.dumps(reference_data,ensure_ascii=False,default=str,separators=(',',':')).encode())>MAX_REFERENCE_BYTES:
+    if reference_bytes(reference_data)>MAX_REFERENCE_BYTES:
         fail(413,'agent_context_too_large','参考资料超过Agent 512KB契约限制；未截断正文或发起请求')
     body={'message':message,'reference_data':reference_data,'response_format':response_format,'trace_id':request_id,'idempotency_key':request_id}
     if scene:body['scene']=scene
+    if scene in GENERATION_SCENES:
+        body['timeout_seconds'] = generation_timeout_budget(fr=scene in FR_GENERATION_SCENES)
     if len(json.dumps(body,ensure_ascii=False,default=str).encode())>MAX_BYTES:
         fail(413,'agent_context_too_large','上下文过大，请减少附件或缩小需求范围；未截断正文')
     return body
@@ -79,7 +85,12 @@ async def reject_upstream(response):
 async def invoke_envelope(body):
     try:
         url=validate_generation_agent_configuration()
-        wait_seconds = settings.agent_fr_timeout_seconds if body.get("scene") == "FROM_UC_CREATE_FR" else settings.agent_timeout_seconds
+        scene = body.get("scene")
+        wait_seconds = (generation_timeout_seconds(fr=scene in FR_GENERATION_SCENES)
+                        if scene in GENERATION_SCENES else settings.agent_timeout_seconds)
+        requested = body.get("timeout_seconds")
+        if scene in GENERATION_SCENES and isinstance(requested, (int, float)) and requested > 0:
+            wait_seconds = min(wait_seconds, requested)
         async with asyncio.timeout(wait_seconds):
             async with agent_client() as client:
                 async with client.stream('POST',url,headers={'X-API-Key':settings.agent_api_key.get_secret_value(),'Accept':'application/json'},json=body,timeout=httpx.Timeout(wait_seconds,connect=5)) as response:
@@ -95,7 +106,7 @@ async def invoke_envelope(body):
         if envelope.get('error') is not None or envelope.get('interrupt') is not None:
             fail(502,'agent_incomplete_result','Agent执行失败或正在等待人工输入，未采纳生成结果')
         return envelope
-    except UcGenerationError as e:
+    except AgentConfigurationError as e:
         fail(e.status,e.code,e.message)
     except (TimeoutError,httpx.TimeoutException):fail(504,'agent_timeout','Agent等待超时；未自动重试')
     except httpx.RequestError:fail(502,'agent_unreachable','无法连接Agent')
@@ -234,6 +245,13 @@ async def generate_allocation_batches(context, client_request_id, request_id):
                         diagnostic('recovery_budget_exhausted', index, part=path, source_count=len(sources))
                         fail(502, 'agent_allocation_recovery_exhausted',
                              'FR分配自动恢复调用次数已达上限，请核对后重试')
+                    # Queued/retried parts inherit the original batch deadline.
+                    remaining = generation_timeout_seconds(fr=True) - (loop.time() - started)
+                    if remaining <= 0:
+                        raise TimeoutError()
+                    body = {**body, "timeout_seconds": min(
+                        generation_timeout_budget(fr=True), max(1, math.ceil(remaining)),
+                    )}
                     calls += 1
                     root_calls[index] += 1
                     extra_calls += int(extra)
@@ -281,7 +299,7 @@ async def generate_allocation_batches(context, client_request_id, request_id):
     pending = []
     try:
         # Includes queueing, backoff, retries and splitting; never resets on recovery.
-        async with asyncio.timeout(settings.agent_fr_timeout_seconds):
+        async with asyncio.timeout(generation_timeout_seconds(fr=True)):
             pending = [asyncio.create_task(one(index, body)) for index, body in enumerate(bodies)]
             completed = await asyncio.gather(*pending)
             result = {'assignments': [row for batch in completed for row in batch]}
@@ -334,6 +352,7 @@ async def chat_stream(body):
                     if 'text/event-stream' not in response.headers.get('content-type',''):
                         fail(502,'agent_stream_required','Agent未返回约定的流式响应')
                     size=0;parts=[]
+                    activity=ActivityStream()
                     async for event in _iter_stream_events(response):
                         kind=event.get('type')
                         if kind=='token':
@@ -343,6 +362,9 @@ async def chat_stream(body):
                             if size>MAX_BYTES:fail(502,'agent_invalid_response','回复过大')
                             parts.append(token)
                             yield {'type':'token','content':token}
+                        elif kind in ('status', 'stage'):
+                            progress=activity.accept(event)
+                            if progress is not None:yield progress
                         elif kind=='error':fail(502,'agent_stream_error','Agent流式执行失败，保留已收到内容')
                         elif kind=='done':
                             if event.get('error') is not None or event.get('interrupt') is not None or (body.get('scene') and event.get('scene')!=body['scene']):
@@ -356,12 +378,16 @@ async def chat_stream(body):
                                 fail(502,'agent_empty_response','Agent未返回内容')
                             yield {'type':'done'};return
                     fail(502,'agent_stream_interrupted','Agent流未正常结束')
-    except (UcGenerationError,AgentExpandError) as e:fail(e.status,e.code,e.message)
+    except (AgentConfigurationError,AgentExpandError) as e:fail(e.status,e.code,e.message)
     except (TimeoutError,httpx.TimeoutException):fail(504,'agent_timeout','Agent对话超时')
     except httpx.RequestError:fail(502,'agent_unreachable','Agent连接中断')
 
 async def modifications(body,attachments):
-    result=await invoke(body)
+    return validate_modifications(await invoke(body), attachments)
+
+
+def validate_modifications(result, attachments):
+    """Validate proposals against trusted snapshots; never apply them."""
     try:
         if set(result)!={'changes'} or not isinstance(result['changes'],list) or not 1<=len(result['changes'])<=20:raise ValueError()
         available={str(x['artifact_id']):x for x in attachments};seen=set();changes=[]
